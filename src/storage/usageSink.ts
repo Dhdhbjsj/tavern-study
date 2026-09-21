@@ -20,7 +20,8 @@ interface UsageSinkEnv {
   OC_DB: D1Database;
 }
 
-const CHANNELS = new Set(['desk', 'desk-timeline', 'desk-board-refresh']);
+// 登记不到这张白名单的 channel 会在下面直接 return——账会静默蒸发,不报错也不落库。
+const CHANNELS = new Set(['desk', 'desk-timeline', 'desk-board-refresh', 'desk-board-auto']);
 
 export function makeD1UsageSink(env: UsageSinkEnv): UsageSink {
   return {

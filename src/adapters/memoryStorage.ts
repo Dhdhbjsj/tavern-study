@@ -16,6 +16,13 @@ export interface MemorySeed {
   deskState?: Record<string, string>;
 }
 
+// SQLite 默认 BINARY 排序规则按字节序比较,不认 locale;localeCompare 受运行环境 locale 影响
+// (比如 'B' 排在 'a' 前后不一定),用它替代 id 并列决胜会跟 D1 的 ORDER BY id 对不上。这里按
+// UTF-16 code unit 逐位比较(JS 原生 </> 就是这个语义),不经过 Intl 排序规则。
+function ordinalCompare(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export class MemoryDeskStoryStorage implements DeskStoryStorage {
   private readonly chapters: Map<string, Chapter>; private readonly state: Record<string, string>;
   constructor(seed: Pick<MemorySeed, 'chapters' | 'deskState'> = {}, chapters?: Map<string, Chapter>) { this.chapters = chapters || new Map((seed.chapters || []).map((chapter) => [chapter.id, structuredClone(chapter)])); this.state = structuredClone(seed.deskState || {}); }
@@ -38,7 +45,7 @@ export class MemoryDeskAssetStorage implements DeskAssetStorage {
         && ((x.scope ?? 'global') === 'global' || ((x.scope ?? 'global') === 'preset' && x.presetId === presetId)))
       .sort((a, b) => scopeRank(a.scope ?? 'global') - scopeRank(b.scope ?? 'global')
         || (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0)
-        || a.id.localeCompare(b.id))
+        || ordinalCompare(a.id, b.id))
       .map(({ scope: _scope, presetId: _presetId, enabled: _enabled, sortOrder: _sortOrder, ...x }) => structuredClone(x));
   }
   async listQueueBlocks(presetId: string) { return (this.seed.deskBlocks || []).filter((x) => x.presetId === presetId).map(({ presetId: _presetId, ...x }) => structuredClone(x)); }
@@ -48,7 +55,9 @@ export class MemoryDeskAssetStorage implements DeskAssetStorage {
     const regexIds = new Set(this.seed.deskRegex.map((item) => item.id));
     if (pack.regex.some((item) => regexIds.has(item.id))) throw new Error('asset pack regex id already exists');
     this.seed.deskPresetIds.push(pack.recipe.presetId); this.seed.deskRecipes.push(structuredClone(pack.recipe));
-    this.seed.deskRegex.push(...structuredClone(pack.regex));
+    // 导入的正则都属于这个预设包,scope 打成 'preset' 并绑 presetId——不打就会被 listUpRegexForPreset
+    // 当成没打过标的记录、按 scope 缺省='global' 处理,名单空时泄漏成别的包也默认挂上(同 D1 importPack 口径)。
+    this.seed.deskRegex.push(...pack.regex.map((rule) => ({ ...structuredClone(rule), scope: 'preset' as const, presetId: pack.recipe.presetId })));
     this.seed.deskBlocks.push(...pack.blocks.map((block) => ({ ...structuredClone(block), presetId: pack.recipe.presetId })));
   }
 }

@@ -41,6 +41,45 @@ test('empty regex list falls back to preset+global, only up/both/enabled rules, 
   assert.deepEqual(ids, ['p0', 'p1', 'g1']);
 });
 
+test('same sortOrder ties break by UTF-16 code unit order, not locale collation — mixed case and non-ASCII ids stay in D1 binary order', async () => {
+  const storage = createMemoryStorage({
+    deskPresetIds: ['p'],
+    deskRegex: [
+      { id: 'a', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+      { id: 'B', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+      { id: 'é', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+      { id: 'z', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+    ],
+  });
+  const ids = (await storage.deskAssets.listUpRegexForPreset('p')).map((row) => row.id);
+  // Code-unit order: 'B'(66) < 'a'(97) < 'z'(122) < 'é'(233) — this diverges from default-locale
+  // collation (which sorts 'a' before 'B' and folds 'é' next to 'e'), matching SQLite's BINARY
+  // default collating sequence that D1's ORDER BY id relies on.
+  assert.deepEqual(ids, ['B', 'a', 'z', 'é']);
+});
+
+test('importPack stamps scope=preset and presetId on its regex rules — a pack default list never leaks another pack\'s rules', async () => {
+  const storage = createMemoryStorage({
+    deskRegex: [{ id: 'g1', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'global', sortOrder: 0 }],
+  });
+  await storage.deskAssets.importPack({
+    project: 'P', name: 'Pack A',
+    recipe: { id: 'recipe-a', presetId: 'preset-a', weight: 'heavy', overrides: {}, regexIds: [], lightSystem: '' },
+    blocks: [],
+    regex: [{ id: 'a1', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {} }],
+  });
+  await storage.deskAssets.importPack({
+    project: 'P', name: 'Pack B',
+    recipe: { id: 'recipe-b', presetId: 'preset-b', weight: 'heavy', overrides: {}, regexIds: [], lightSystem: '' },
+    blocks: [],
+    regex: [{ id: 'b1', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {} }],
+  });
+  // regexIds is empty on both recipes, so each preset's default list must only pick up its own
+  // pack's rule plus the explicit global one — never the sibling pack's rule.
+  assert.deepEqual((await storage.deskAssets.listUpRegexForPreset('preset-a')).map((row) => row.id), ['a1', 'g1']);
+  assert.deepEqual((await storage.deskAssets.listUpRegexForPreset('preset-b')).map((row) => row.id), ['b1', 'g1']);
+});
+
 test('returns cloned asset values rather than exposing adapter state', async () => {
   const storage = createMemoryStorage({ deskPresetIds: ['p'], deskRecipes: [
     { id: 'r', presetId: 'p', weight: 'heavy', overrides: {}, regexIds: ['x'], lightSystem: '' },

@@ -43,24 +43,34 @@ export class D1DeskTurnStorage implements DeskTurnStorage {
   }
 
   // 四证 CAS:板字节+窗口updated_at 未变、本楼仍是该窗最新一楼(NOT EXISTS 更晚的楼层)、楼层
-  // content/commitToken 未变,全部成立才写;第二条 UPDATE 若被挤掉只记日志,窗口那条已经写成功不回滚。
+  // content/commitToken 未变,全部成立才写。两条 UPDATE 必须放同一个 db.batch——D1 的 batch 是单个
+  // 隐式事务(同一连接内顺序执行,提交或整体回滚,不会被别的写入方插在两条中间),两条各自的 changes
+  // 因此天然同进同退,不会出现"窗口那条改了、楼层那条因为中途被并发编辑改动而落空"的半截态
+  // (之前拆成两次独立 .run() 请求时,两次网络往返之间是有空档给并发写入插进来的)。
   async autoRefreshBoard(input: DeskAutoRefreshBoardInput): Promise<DeskAutoRefreshBoardResult> {
-    const winRes = await this.db.prepare(
-      `UPDATE desk_windows SET state_board = ?, updated_at = ?
-        WHERE id = ? AND state_board = ? AND updated_at = ?
-          AND NOT EXISTS (SELECT 1 FROM desk_floors WHERE window_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)))
-          AND EXISTS (SELECT 1 FROM desk_floors WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?)`
-    ).bind(
-      JSON.stringify(input.nextBoard), input.refreshedAt,
-      input.windowId, JSON.stringify(input.expectedWindowStateBoard), input.expectedWindowUpdatedAt,
-      input.windowId, input.expectedFloorCreatedAt, input.expectedFloorCreatedAt, input.floorId,
-      input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
-    ).run();
-    if ((winRes.meta?.changes ?? 0) !== 1) return { ok: false, reason: 'window CAS missed (board/updated_at stale, floor superseded, or content/commitToken mismatch)' };
-    const repRes = await this.db.prepare(
-      `UPDATE desk_floors SET report = ? WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?`
-    ).bind(JSON.stringify(input.nextFloorReport), input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken).run();
-    if ((repRes.meta?.changes ?? 0) !== 1) return { ok: false, reason: 'window CAS committed but floor changed before its report could be tagged' };
+    const results = await this.db.batch([
+      this.db.prepare(
+        `UPDATE desk_windows SET state_board = ?, updated_at = ?
+          WHERE id = ? AND state_board = ? AND updated_at = ?
+            AND NOT EXISTS (SELECT 1 FROM desk_floors WHERE window_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)))
+            AND EXISTS (SELECT 1 FROM desk_floors WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?)`
+      ).bind(
+        JSON.stringify(input.nextBoard), input.refreshedAt,
+        input.windowId, JSON.stringify(input.expectedWindowStateBoard), input.expectedWindowUpdatedAt,
+        input.windowId, input.expectedFloorCreatedAt, input.expectedFloorCreatedAt, input.floorId,
+        input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
+      ),
+      // 与第一条共享同一份 content/commitToken 前置(同一事务内这两个值中途不会被第三方改动),
+      // 第一条的 EXISTS 子句判过真,这条的 WHERE 用相同谓词重复判定必然同真,不会各判各的。
+      this.db.prepare(
+        `UPDATE desk_floors SET report = ? WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?`
+      ).bind(JSON.stringify(input.nextFloorReport), input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken),
+    ]);
+    const winChanges = results[0]?.meta?.changes ?? 0;
+    const repChanges = results[1]?.meta?.changes ?? 0;
+    if (winChanges !== 1 || repChanges !== 1) {
+      return { ok: false, reason: `window CAS ${winChanges === 1 ? 'matched' : 'missed'}, floor report tag ${repChanges === 1 ? 'matched' : 'missed'}` };
+    }
     return { ok: true };
   }
 }

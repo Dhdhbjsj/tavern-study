@@ -120,6 +120,40 @@ test('autoRefreshBoard: any of the four checks failing leaves storage untouched 
   assert.deepEqual(await storage.desk.getFloor('f'), floorBefore);
 });
 
+test('autoRefreshBoard never writes the window board without also tagging the floor report (no half-committed state)', async () => {
+  // Regression guard for the class of bug the D1 adapter's db.batch fixes: a naive
+  // window-write-then-floor-write split could leave the window board updated while the floor's
+  // report never got its stateBoardAutoRefreshed tag, if the floor changed between the two writes.
+  // Here the window's own CAS inputs (board bytes/updated_at) are still fresh, but the floor's
+  // content no longer matches (as if it had been hand-edited between the snapshot and this call) —
+  // the whole call must be all-or-nothing: window state_board must stay untouched, not just the floor.
+  const storage = await seededStorage();
+  const backend = new FakeModelBackend({ ok: true, terminal: 'clean', text: 'story with no fence', thinking: '', usage });
+  const service = new DeskGenerationService(backend, storage.deskTurn);
+  await service.generate({ windowId: 'w', mode: 'normal', floorId: 'f', userFloor: userSeed, system: [], prompt: 'go', model: 'fake', report: {}, stateBoard: protoBoard('old'), boardBeforeTrusted: true, committedAt: 't1' });
+  const floorBefore = await storage.desk.getFloor('f');
+  const windowBefore = await storage.desk.getWindow('w');
+  const commitToken = (floorBefore?.report as any)?.commitToken;
+
+  const nextBoard = protoBoard('auto');
+  const refresh = await storage.deskTurn.autoRefreshBoard({
+    windowId: 'w', floorId: 'f',
+    expectedWindowStateBoard: windowBefore!.stateBoard, // still matches — window's own CAS would pass
+    expectedWindowUpdatedAt: windowBefore!.updatedAt,   // still matches
+    expectedFloorCreatedAt: floorBefore!.createdAt,
+    expectedFloorContent: 'edited elsewhere',            // does not match floorBefore.content
+    expectedFloorCommitToken: commitToken,
+    nextBoard,
+    nextFloorReport: { ...floorBefore!.report, commitToken, boardAfter: nextBoard, stateBoardAutoRefreshed: true },
+    refreshedAt: 't2',
+  });
+  assert.equal(refresh.ok, false);
+  // The window's board must not have been written even though its own CAS inputs matched —
+  // both writes are gated on the same floor-identity check, atomically.
+  assert.deepEqual((await storage.desk.getWindow('w'))?.stateBoard, windowBefore!.stateBoard);
+  assert.deepEqual(await storage.desk.getFloor('f'), floorBefore);
+});
+
 test('does not let an untrusted roll smuggle board snapshots through report fields', async () => {
   const oldFloor = { id: 'f', windowId: 'w', role: 'assistant' as const, content: 'v1', variants: ['v1'], activeVariant: 0, thinking: null, report: {}, createdAt: 't0' };
   const storage = createMemoryStorage({ deskWindows: [windowSeed], deskFloors: [oldFloor] });

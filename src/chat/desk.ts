@@ -324,6 +324,9 @@ export async function handleDeskChat(
     let floorId = '';
     let floorCreatedAt = '';
     let committedReport: Record<string, unknown> | null = null;
+    // roll 分支落库后还会跑时光带后栅栏,栅栏会再写一次 desk_windows.updated_at(见下方注释)——
+    // 自动补算的窗口 CAS 必须对着栅栏之后的最新值比,这里先占 now,roll 分支落地后再纠正。
+    let windowUpdatedAtForAutoRefresh: string | null = now;
 
     // 楼层写与窗口板 UPDATE 同事务；任一失败整批回滚，禁止半截态。
     if (mode === 'normal') {
@@ -349,6 +352,17 @@ export async function handleDeskChat(
       committedReport = committed.report;
 
       await fenceDeskTimelineAfterWrite(env as any, windowId, inv.rev, { createdAt: String(lastFloor.createdAt), id: floorId });
+      // 栅栏内部会再 CAS 写一次 desk_windows.updated_at(推进时光带 rev,state_board 不碰)——
+      // 自动补算若还拿上面的 now 当窗口 CAS 期望值,栅栏一跑就必然对不上、每次都落不了库
+      // (只记日志,不影响这轮已落库的楼层)。这里补算前重读一次窗口拿到栅栏之后的真实值;
+      // 读不到/窗口没了就让下面的自动补算整体跳过,不拿旧值硬凑。
+      try {
+        const freshWindow = await deskStorage.getWindow(windowId);
+        windowUpdatedAtForAutoRefresh = freshWindow ? freshWindow.updatedAt : null;
+      } catch (e) {
+        console.error('[desk] 时光带栅栏后重读窗口失败,这轮跳过状态板自动补算', e);
+        windowUpdatedAtForAutoRefresh = null;
+      }
     }
 
     // 自动补算:模型这楼没写板/没过闸(stale)时,按本楼正文让模型补一份直接落库。输入板为空算不出,
@@ -357,7 +371,7 @@ export async function handleDeskChat(
     // 刚才 commitAssistantFloor/rollAssistantFloor 回填的 report,不在这里自己造。
     const commitToken = committedReport && typeof (committedReport as any).commitToken === 'string'
       ? (committedReport as any).commitToken as string : null;
-    if (!boardUsable && commitToken && content.trim() && Object.keys(effectiveStateBoard).length > 0) {
+    if (!boardUsable && commitToken && windowUpdatedAtForAutoRefresh && content.trim() && Object.keys(effectiveStateBoard).length > 0) {
       try {
         // 补算走摘要模型实测半分钟量级,done 会晚这么久——先给前端一条 status 免得像卡死
         await send({ type: 'status', text: '状态板正在按本楼正文补算一份，约半分钟…' });
@@ -368,7 +382,7 @@ export async function handleDeskChat(
           const result = await turnStorage.autoRefreshBoard({
             windowId, floorId,
             expectedWindowStateBoard: appliedBoard,
-            expectedWindowUpdatedAt: now,
+            expectedWindowUpdatedAt: windowUpdatedAtForAutoRefresh,
             expectedFloorCreatedAt: floorCreatedAt,
             expectedFloorContent: content,
             expectedFloorCommitToken: commitToken,

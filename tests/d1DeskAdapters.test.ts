@@ -64,6 +64,36 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     assert.equal((await assets.listQueueBlocks('p')).length, 1);
     assert.deepEqual((await assets.listUpRegexForPreset('p')).map((row) => row.id), ['rx']);
 
+    // autoRefreshBoard: the two UPDATEs run inside one db.batch (single implicit D1 transaction) —
+    // a matching call writes both window.state_board and the floor's report tag together; a call
+    // whose floor-identity input no longer matches must leave BOTH untouched, even when the
+    // window's own CAS inputs (board bytes/updated_at) still match on their own — proving the two
+    // writes are gated on the same shared precondition rather than applied independently.
+    await desk.createWindow({ ...window, id: 'w3' });
+    const refreshCommit = await turns.commitAssistantFloor('w3', 'rf', { content: 'stale text', thinking: null, report: { stateBoardStale: true }, stateBoard: { step: 1 }, committedAt: t2 });
+    const refreshToken = String(refreshCommit?.report?.commitToken);
+    const okRefresh = await turns.autoRefreshBoard({
+      windowId: 'w3', floorId: 'rf',
+      expectedWindowStateBoard: { step: 1 }, expectedWindowUpdatedAt: t2,
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'stale text', expectedFloorCommitToken: refreshToken,
+      nextBoard: { step: 2 }, nextFloorReport: { stateBoardStale: true, commitToken: refreshToken, boardAfter: { step: 2 }, stateBoardAutoRefreshed: true },
+      refreshedAt: 't6',
+    });
+    assert.deepEqual(okRefresh, { ok: true });
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 });
+    assert.equal((await desk.getFloor('rf'))?.report?.stateBoardAutoRefreshed, true);
+
+    const missedRefresh = await turns.autoRefreshBoard({
+      windowId: 'w3', floorId: 'rf',
+      expectedWindowStateBoard: { step: 2 }, expectedWindowUpdatedAt: 't6', // matches the state just written above
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'a different snapshot of the text', expectedFloorCommitToken: refreshToken,
+      nextBoard: { step: 3 }, nextFloorReport: { stateBoardAutoRefreshed: true },
+      refreshedAt: 't7',
+    });
+    assert.equal(missedRefresh.ok, false);
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // not bumped to step 3
+    assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // report untouched from the earlier successful refresh
+
     const reading = new D1ReadingStorage(db);
     await reading.createChapter({ id: 'ch', project: 'P', chapterNo: '1', title: 'One', content: 'Body', summary: '', status: 'draft', createdAt: 't0', updatedAt: 't0', publishedAt: null });
     assert.equal((await reading.publishChapter('ch', 't1'))?.status, 'published');
