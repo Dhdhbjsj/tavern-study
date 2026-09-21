@@ -48,28 +48,45 @@ export class D1DeskTurnStorage implements DeskTurnStorage {
   // ⚠️batch 不自动联动:第一条(窗口)WHERE 命中 0 行时,第二条(楼层)若只看 content/commitToken,
   // 这两个值跟窗口那条是否写成功无关——窗口那条落空、楼层这条照样能命中,楼层被打上
   // stateBoardAutoRefreshed 但 boardAfter 指向一块从未真正写进窗口的板(反向半截态)。
-  // 修法:楼层这条也加一个 EXISTS,绑窗口那条**写入后的新值**(nextBoard JSON、refreshedAt)——
-  // 同一事务里第二条能看见第一条已经写下的结果,第一条没写成,窗口的 state_board/updated_at
-  // 就还是旧值、绝不会等于这里绑的新值,这条 EXISTS 必然判假,两条真正同进同退。
+  // 修法有两层,互为保险:
+  //   ①(SELECT changes())=1:D1 batch 同连接顺序执行,SQLite 的 changes() 反映"这条连接上最近
+  //     一条已完成语句改了几行"——这里就是紧邻的上一条(窗口那条)。实测过(交工报告有记录):
+  //     上一条改 1 行,changes()=1;上一条改 0 行,这条即便自己的 WHERE 本来能命中也会因
+  //     changes()=0 一起判假,直接、不依赖任何值比较,是主要判据。
+  //   ② EXISTS(窗口 = 写入后的新值 nextBoard/refreshedAt)当第二道闸:同一事务里第二条能看见
+  //     第一条真正写下的结果。但若"补算出来的新板字节巧合等于旧板"且"refreshedAt 巧合等于旧
+  //     updated_at",窗口那条哪怕 0 行,旧值本身就满足这条 EXISTS,这道闸会被绕过——所以下面
+  //     先保证 refreshedAt 严格不等于 expectedWindowUpdatedAt(撞了就拨后 1ms),让
+  //     "updated_at = refreshedAt" 只可能是本批第一条写出来的,堵上这道闸自己的漏洞。
+  //   两条谓词都补了 window_id(第一条的楼层 EXISTS、第二条的楼层 UPDATE),对齐内存实现里
+  //   `floor.windowId !== input.windowId` 的检查——不然传错窗口时可能误命中别的窗口下的同名楼层。
   async autoRefreshBoard(input: DeskAutoRefreshBoardInput): Promise<DeskAutoRefreshBoardResult> {
+    let refreshedAt = input.refreshedAt;
+    if (refreshedAt === input.expectedWindowUpdatedAt) {
+      const asDate = new Date(refreshedAt);
+      refreshedAt = Number.isNaN(asDate.getTime())
+        ? `${refreshedAt}\u0000bump` // 非 ISO 字符串(测试夹具用的占位时间戳)兜底,只求跟旧值不同
+        : new Date(asDate.getTime() + 1).toISOString();
+    }
     const results = await this.db.batch([
       this.db.prepare(
         `UPDATE desk_windows SET state_board = ?, updated_at = ?
           WHERE id = ? AND state_board = ? AND updated_at = ?
             AND NOT EXISTS (SELECT 1 FROM desk_floors WHERE window_id = ? AND (created_at > ? OR (created_at = ? AND id > ?)))
-            AND EXISTS (SELECT 1 FROM desk_floors WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?)`
+            AND EXISTS (SELECT 1 FROM desk_floors WHERE id = ? AND window_id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?)`
       ).bind(
-        JSON.stringify(input.nextBoard), input.refreshedAt,
+        JSON.stringify(input.nextBoard), refreshedAt,
         input.windowId, JSON.stringify(input.expectedWindowStateBoard), input.expectedWindowUpdatedAt,
         input.windowId, input.expectedFloorCreatedAt, input.expectedFloorCreatedAt, input.floorId,
-        input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
+        input.floorId, input.windowId, input.expectedFloorContent, input.expectedFloorCommitToken,
       ),
       this.db.prepare(
-        `UPDATE desk_floors SET report = ? WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?
+        `UPDATE desk_floors SET report = ? WHERE id = ? AND window_id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?
+          AND (SELECT changes()) = 1
           AND EXISTS (SELECT 1 FROM desk_windows WHERE id = ? AND state_board = ? AND updated_at = ?)`
       ).bind(
-        JSON.stringify(input.nextFloorReport), input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
-        input.windowId, JSON.stringify(input.nextBoard), input.refreshedAt,
+        JSON.stringify(input.nextFloorReport), input.floorId, input.windowId, input.expectedFloorContent, input.expectedFloorCommitToken,
+        input.windowId, JSON.stringify(input.nextBoard), refreshedAt,
       ),
     ]);
     const winChanges = results[0]?.meta?.changes ?? 0;

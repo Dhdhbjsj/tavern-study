@@ -136,6 +136,44 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // not bumped to step 5
     assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // report not overwritten with the decoy
 
+    // Reverse half-state (codex round 3, #1): the floor EXISTS(window = new values) guard alone can
+    // be fooled when the "new" values coincide with values the window already holds — here nextBoard
+    // is byte-identical to the board already stored, and refreshedAt is passed as the window's
+    // current (and expected) updated_at, while rf2 (still present from the test above) makes the
+    // window UPDATE fail on its NOT EXISTS clause alone. Without the (SELECT changes())=1 guard and
+    // the internal refreshedAt-bump, the floor UPDATE would see its EXISTS(window=new values) satisfied
+    // by sheer coincidence and wrongly tag the floor even though the window write did nothing.
+    const coincidentalValues = await turns.autoRefreshBoard({
+      windowId: 'w3', floorId: 'rf',
+      expectedWindowStateBoard: { step: 2 }, expectedWindowUpdatedAt: 't6', // matches the window's real current state
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'stale text', expectedFloorCommitToken: refreshToken,
+      nextBoard: { step: 2 }, // identical bytes to the board already stored
+      nextFloorReport: { stateBoardAutoRefreshed: true, decoy: 'must not land' },
+      refreshedAt: 't6', // identical to the window's current (and expected) updated_at
+    });
+    assert.equal(coincidentalValues.ok, false);
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 });
+    assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 });
+    assert.equal((await desk.getFloor('rf'))?.report?.decoy, undefined);
+
+    // codex round 3, #2: the floor predicates must be bound to window_id too, or a wrong windowId
+    // paired with a floorId that actually belongs to a different window could still match. w4 is a
+    // separate, real window; rf belongs to w3, not w4 — everything about w4's own CAS inputs is
+    // otherwise correct, and rf's content/commitToken are otherwise correct too, but the pairing is
+    // wrong and nothing may move.
+    await desk.createWindow({ ...window, id: 'w4', stateBoard: { other: true }, updatedAt: t0 });
+    const crossWindow = await turns.autoRefreshBoard({
+      windowId: 'w4', floorId: 'rf', // rf actually belongs to w3
+      expectedWindowStateBoard: { other: true }, expectedWindowUpdatedAt: t0, // w4's own real current state
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'stale text', expectedFloorCommitToken: refreshToken, // rf's real identity
+      nextBoard: { hijacked: true }, nextFloorReport: { stateBoardAutoRefreshed: true, decoy: 'must not land' },
+      refreshedAt: 't10',
+    });
+    assert.equal(crossWindow.ok, false);
+    assert.deepEqual((await desk.getWindow('w4'))?.stateBoard, { other: true }); // w4 untouched
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // w3 untouched too
+    assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // rf's report untouched
+
     const reading = new D1ReadingStorage(db);
     await reading.createChapter({ id: 'ch', project: 'P', chapterNo: '1', title: 'One', content: 'Body', summary: '', status: 'draft', createdAt: 't0', updatedAt: 't0', publishedAt: null });
     assert.equal((await reading.publishChapter('ch', 't1'))?.status, 'published');
