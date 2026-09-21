@@ -49,9 +49,12 @@ test('schema init.sql, a from-scratch migration run, and an init.sql database th
     // fixes the default in place (table rebuild) for databases that already ran 0001. Every other
     // line must still match byte-for-byte (both files are otherwise idempotent: CREATE TABLE/INDEX/
     // TRIGGER IF NOT EXISTS + INSERT OR IGNORE, see the third path below for why that matters).
+    // Second intentional divergence: init.sql is a snapshot of the post-0002 schema, so it also
+    // records schema_versions(2); 0001 only records version 1 (0002 adds its own row when it runs).
     const normalize = (sql: string) => sql.replaceAll('\r\n', '\n')
       .replace('note_depth INTEGER NOT NULL DEFAULT 1', 'note_depth INTEGER NOT NULL DEFAULT __N__')
-      .replace('note_depth INTEGER NOT NULL DEFAULT 3', 'note_depth INTEGER NOT NULL DEFAULT __N__');
+      .replace('note_depth INTEGER NOT NULL DEFAULT 3', 'note_depth INTEGER NOT NULL DEFAULT __N__')
+      .replace('INSERT OR IGNORE INTO schema_versions(version) VALUES (2);\n', '');
     assert.equal(normalize(init), normalize(migration));
 
     const initDir = join(root, 'init'); const initConfig = join(root, 'config-init');
@@ -98,7 +101,10 @@ test('schema init.sql, a from-scratch migration run, and an init.sql database th
     // schema_versions must have exactly one row per version — 0001's INSERT OR IGNORE means
     // replaying it against an init.sql database (which already inserted version 1 itself) does not
     // produce a duplicate, and 0002 must have actually run (not just been skipped) to add version 2.
+    // A fresh init.sql install is a snapshot of the post-0002 schema and must advertise the same
+    // history, otherwise operators reading schema_versions would think it still needs 0002.
     const versionsOf = (dir: string, config: string) => runWranglerQuery('SELECT version FROM schema_versions ORDER BY version', dir, config).map((row: any) => row.version);
+    assert.deepEqual(versionsOf(initDir, initConfig), [1, 2]);
     assert.deepEqual(versionsOf(upgradeDir, upgradeConfig), [1, 2]);
     assert.deepEqual(versionsOf(migDir, migConfig), [1, 2]);
   } finally {

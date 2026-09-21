@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS schema_versions (
   applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO schema_versions(version) VALUES (1);
+INSERT OR IGNORE INTO schema_versions(version) VALUES (2);
 
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
