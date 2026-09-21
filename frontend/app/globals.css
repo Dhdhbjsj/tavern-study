@@ -78,3 +78,6 @@ body {
 }
 .pill { transition: filter 0.15s ease; }
 .pill:hover { filter: brightness(0.97); }
+
+/* ── 气泡断词：长英文/URL 允许在任意处折行，不撑破气泡 ── */
+.wrap-hard { overflow-wrap: break-word; overflow-wrap: anywhere; }

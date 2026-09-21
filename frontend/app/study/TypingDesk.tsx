@@ -15,9 +15,11 @@
 // 积木/世界书/正则这些"抽屉"通通走独立的抽屉面板,不在主流程里。
 
 import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback, forwardRef, useImperativeHandle } from 'react';
+import { createPortal } from 'react-dom';
 import DeskDrawerHub, { type DeskDrawerHandle, type DeskDrawerTabKey } from './DeskDrawers';
 import LoreWindow from './LoreWindow';
 import { applyDownRegex, segmentRendered, buildCardSrcDoc, DESK_CARD_MAX_HEIGHT, foldProtocolBlocks, unwrapContentTagClient, type DeskRegexRule, type RenderSegment, type FoldPart } from './deskRender';
+import { useStudyShell } from './studyShell';
 
 // ── 数据形状(照后端 tools/deskWindows.ts / deskRecipes.ts / tools/desk.ts / chat/deskAssemble.ts 的真实返回来,字段名不许自己发明) ──
 type Weight = 'light' | 'heavy';
@@ -135,7 +137,7 @@ function fmtTime(iso?: string): string {
     return `${date} ${time}`;
   } catch { return ''; }
 }
-function grow(el: HTMLTextAreaElement | null, composing = false) {
+function grow(el: HTMLTextAreaElement | null, composing = false, cap = 240) {
   if (!el) return;
   // 楼层行内编辑:height='auto'→重设成scrollHeight这套自增高手法,每次都会强制一次同步reflow
   // ——测"内容变短了要不要收缩"这一步躲不掉(不先清掉height,scrollHeight在没溢出时就等于当前
@@ -170,7 +172,7 @@ function grow(el: HTMLTextAreaElement | null, composing = false) {
   // 所以补一个 extra(=offsetHeight-clientHeight),否则每次都差两像素、内容永远差一点点装不下。
   if (el.scrollHeight <= el.clientHeight) return;
   const extra = el.offsetHeight - el.clientHeight;
-  const next = Math.min(el.scrollHeight + extra, 240);
+  const next = Math.min(el.scrollHeight + extra, cap);
   const prev = parseFloat(el.style.height) || 0;
   if (next <= prev) return; // 已经到顶(或没变高)——同样不写,不制造无谓重排
   const focused = document.activeElement === el;
@@ -361,13 +363,37 @@ const DESK_MODELS = [
   { id: 'claude-fable-5-1', label: 'Fable 5.1' },
 ];
 
+// ── 楼层正文的稳定分块(选字保护的另一半):整段 {text} 单文本节点渲染时,每来一块流 React 都
+// 重写整个节点,正在选的选区当场被冲掉。切成固定步长的 <span> 后新字只落在最后一段,前面
+// 段的文本节点原样不动,选区活得下来。切点只依赖前缀内容(确定性),文本增长不挪已有边界;
+// 只在完整 code point 上落刀,防止把 surrogate 对劈成两半渲染成乱码(流末尾恰好断在高位半对时
+// 不强行并块,渲染跟现状一致,低位到货后边界一次性定型)。
+// ⚠️流式/落库两态都走这条路:settle 那一拍若从 span 分块切回单节点,DOM 身份一换选区照样死在
+// "刚写完"最要命的一瞬——正文没变时分块结果逐字节相同,React 一个节点都不会碰。
+// 设计内接受的残余:最后一个未填满的块仍随流增长,选区端点落在流尾这≤128字里会被下一块流冲掉,
+// 再选一次即可。根治要按"到货增量"记span(状态化+settle/对账两处随身携带),复杂度与回归面
+// 不成比例;128的块把损失窗口压到一两句话,其余正文全程可选可复制。
+const STREAM_CHUNK = 128;
+function chunkStreamText(s: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < s.length) {
+    let end = Math.min(i + STREAM_CHUNK, s.length);
+    const c = s.charCodeAt(end - 1);
+    if (c >= 0xd800 && c <= 0xdbff && end < s.length) end++;
+    out.push(s.slice(i, end));
+    i = end;
+  }
+  return out;
+}
+
 // ── 每楼下方的动作条(编辑/复制/透视/楼层号/时间戳)。user 楼层和 assistant 楼层共用同一条,
 // 靠 isAssistant 挑行为——挂在模块顶层而不是 write 屏渲染函数内部,免得每次 .map() 迭代都现造一个
 // 新组件类型(那样 React 每帧都会当成全新元素卸载重挂,编辑框/焦点全丢),所有依赖都走 props 传入。
 function FloorActionRow({
   f, isAssistant, sending, mutBusy, onEdit, onCopy, onToggleReport,
   floorNo, extra,
-  isLast, onReroll, onResend,
+  isLast, onReroll, onResend, afterReroll,
 }: {
   f: Floor; isAssistant?: boolean; sending: boolean; mutBusy: boolean;
   onEdit: (f: Floor) => void; onCopy: (text: string) => void; onToggleReport: (key: string) => void;
@@ -380,6 +406,8 @@ function FloorActionRow({
   // 情形的调用点会传(见写作屏 user 楼渲染那处),天然限定"user only"+"last only"——不需要
   // 在这里再判 role,调用方已经把条件收窄了。
   onResend?: (f: Floor) => void;
+  // 紧跟在「重roll」后面的附加动作(目前只有最近一条 AI 楼的「重算」板钮)——位置固定在这里
+  afterReroll?: React.ReactNode;
 }) {
   return (
     <div className="flex items-center gap-3 px-1.5 flex-wrap">
@@ -414,6 +442,7 @@ function FloorActionRow({
       {isAssistant && isLast && f.id && !sending && !mutBusy && onReroll && (
         <button onClick={() => onReroll(f)} className="serc text-[11px] text-ink2 hover:text-accent">重roll</button>
       )}
+      {afterReroll}
       <span className="ser text-[11px] text-ink2">第{floorNo}楼</span>
       {f.createdAt && <span className="ser text-[11px] text-ink2">{fmtTime(f.createdAt)}</span>}
     </div>
@@ -430,6 +459,11 @@ function FloorActionRow({
 export type TypingDeskHandle = { requestLeave: () => boolean };
 
 const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; onBack: () => void }>(function TypingDesk({ base, envOk, onBack }, deskRef) {
+  // 壳槽位(见 studyShell.tsx):topEl/bottomEl 是头尾栏 portal 目标,scrollEl 是应用滚动唯一量尺。
+  const { topEl, bottomEl, scrollEl } = useStudyShell();
+  // 应用滚动的合法上限与钳制:落底/锚定一律走这两把尺。
+  const docBottomTop = useCallback(() => Math.max(0, (scrollEl?.scrollHeight ?? 0) - (scrollEl?.clientHeight ?? 0)), [scrollEl]);
+  const clampScrollTop = useCallback((top: number) => Math.min(docBottomTop(), Math.max(0, top)), [docBottomTop]);
   const [mode, setMode] = useState<'list' | 'write'>('list');
   const [projects, setProjects] = useState<string[]>(DEFAULT_PROJECTS);
   const [project, setProject] = useState<string>(DEFAULT_PROJECTS[0]);
@@ -465,19 +499,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     try { setIsTouch(window.matchMedia('(pointer: coarse)').matches); } catch {}
   }, []);
 
-  // iOS 第三方键盘"收起"只藏键盘不 blur 时的滚动兜底(同编辑部,全组件生命周期挂着,无害)
-  useEffect(() => {
-    const vv = window.visualViewport;
-    if (!vv) return;
-    const onVvResize = () => {
-      const keyboardGone = window.innerHeight - vv.height < 60;
-      if (!keyboardGone) return;
-      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-      if (window.scrollY > maxScroll) window.scrollTo(0, maxScroll);
-    };
-    vv.addEventListener('resize', onVvResize);
-    return () => vv.removeEventListener('resize', onVvResize);
-  }, []);
+  // iOS 键盘收起后 window 幻影滚动位的按回归壳级"窗口不滚守则"统一处理(见 page.tsx),
+  // 这里不再重复挂一份组件级兜底。
 
   // ── 项目集合:软性增强,拿不到也不影响主流程(见文件头注释) ──
   // 原先只从配方列表反推——配方通用化后新配方project='',
@@ -930,7 +953,38 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 下一次loadWindow调用去顶,免得旧GET在那之前的窗口期内抢先落地)。genRef管"世界翻篇"(切窗/返回
   // 列表),loadSeqRef管"同一扇窗内的轮次先后"——两闸并联,谁的场子谁看门。
   const loadSeqRef = useRef(0);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  // 落底滚滚动区真底部,落底与"dist<120"贴底判定共用同一把尺。
+  // ⚠️目标先钳到 scrollHeight-clientHeight:放大态 scrollTo 不夹紧,越界会把滚动位钉在内容之外。
+  const scrollToDocBottom = useCallback(() => { scrollEl?.scrollTo({ top: docBottomTop(), behavior: 'auto' }); }, [scrollEl, docBottomTop]);
+  // 进窗落底走独立的确定性通道,不搭钉底跟滚的便车:跟滚效果在绘制后才跑(先见顶再跳底,闪两拍),
+  // 且触屏进窗的点按会触发选字宽限/微滚事件,能把 pinnedRef 意外掀翻——楼层真值首批到达时在
+  // 绘制前同步落底,并强制重钉,进窗永远从底部看起。
+  // ⚠️先确认 scrollEl 存在再清 pending,否则一次性锚永久丢失。
+  const pendingEnterScrollRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!scrollEl || !pendingEnterScrollRef.current || !floors.length) return;
+    pendingEnterScrollRef.current = false;
+    pinnedRef.current = true;
+    scrollToDocBottom();
+  }, [floors, scrollEl, scrollToDocBottom]);
+  // 渲染窗口:只渲染最近 N 楼,老楼点"展开更早"分批放——完整长文档永远不同时成为活跃 DOM,
+  // 进窗/回列表的巨树提交与整页重光栅从根上消失。展开是用户主动的单次动作,一次一锚,不做
+  // 自动分步补挂(连环跳变=连环重光栅)。
+  const FLOOR_VISIBLE_INIT = 40;
+  const FLOOR_VISIBLE_STEP = 60;
+  const [floorVisibleCount, setFloorVisibleCount] = useState(FLOOR_VISIBLE_INIT);
+  // 展开锚(带世界代数,快速切窗时旧锚作废):点钮时记"滚动区底到视口顶的间距",展开 commit 绘制前原数滚掉
+  // ⚠️同上,先确认 scrollEl 存在再清 anchor。
+  const expandAnchorRef = useRef<{ gen: number; gap: number } | null>(null);
+  useLayoutEffect(() => {
+    const rec = expandAnchorRef.current;
+    if (!scrollEl || !rec) return;
+    expandAnchorRef.current = null;
+    if (rec.gen !== genRef.current) return;
+    scrollEl.scrollTo(0, clampScrollTop(scrollEl.scrollHeight - rec.gap));
+  }, [floorVisibleCount, scrollEl, clampScrollTop]);
+  const floorOldCount = Math.max(0, floors.length - floorVisibleCount);
+  const visibleFloors = floorOldCount > 0 ? floors.slice(floorOldCount) : floors;
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   // 当场这一轮(send/reroll/continue)的收尾 promise——切窗/返回列表前必须先等它落地,
@@ -958,19 +1012,16 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 不新起够到头栏 z-10/底栏 z-[2] 的层级——已经因为够太高被拦过一次),同层级下 fixed 元素
   // 谁在 DOM 里靠后谁盖住谁,两块面板的 JSX 挪到 <main> 之后渲染,天然赢过滚动中的对话内容。
   //
-  // 浮窗顶上的面板标题被头栏遮住——真凶:ResizeObserver 默认量的是
-  // content-box(entry.contentRect 天生就是这个,跟 observe() 有没有传 box 选项无关),header/
-  // footer 却都吃了 padding(px-6 py-3 一类)+ border(border-b 1px)——headerH/footerH 因此永远
-  // 比头栏/底栏*真正*的渲染高度矮了"padding+border"这一截。浮窗 top:headerH 顶的是这个偏矮的
-  // 数字,于是浮窗的最上面一小截(它自己的标题区)其实叠进了头栏底部那圈 padding/border 的屏幕
-  // 区域——头栏 z-10 比浮窗 z-[1] 高,画面上就是头栏"盖住"了浮窗标题。改法:显式管 border-box
-  // (entry.borderBoxSize,含 padding+border,才是头栏底边在屏幕上的真实位置),没有这个字段的
-  // 极端环境(旧引擎/测试环境 polyfill 缺失)兜底退回 getBoundingClientRect().height——两条路径
-  // 量出来的都是"这块元素在屏幕上到底占多高",top:headerH 才会精确顶在头栏视觉下边缘,不多不少。
+  // ⚠️测量必须按 border-box/getBoundingClientRect(含 padding+border):ResizeObserver 的
+  // contentRect 天生是 content-box,头栏/底栏都吃了 padding+border,拿它当"屏幕上占多高"会
+  // 系统性偏矮一截,浮窗标题会叠进头栏底边被盖住。
   const headerRef = useRef<HTMLElement>(null);
   const footerRef = useRef<HTMLElement>(null);
-  const [headerH, setHeaderH] = useState(64);
   const [footerH, setFooterH] = useState(88);
+  // 浮窗 fixed 钉视口后的水平尺:对齐写作列(视口减竖廊),从头栏实测矩形取 left/width——
+  // 头栏 sticky 在列内、恒与列同宽,是现成的列尺;竖廊收展会改头栏宽度,同一个 RO 自然跟手。
+  const [colRect, setColRect] = useState<{ left: number; width: number } | null>(null);
+  // ⚠️依赖 topEl/bottomEl:头尾栏 portal 进槽,槽位就绪后才有 headerRef/footerRef。
   useEffect(() => {
     if (mode !== 'write') return;
     const headerEl = headerRef.current;
@@ -979,17 +1030,23 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const target = entry.target as HTMLElement;
-        const bbs = entry.borderBoxSize;
-        const box = bbs ? (Array.isArray(bbs) ? bbs[0] : bbs) : null; // 规范是数组,老实现/polyfill 可能给单个对象
-        const h = box ? Math.round(box.blockSize) : Math.round(target.getBoundingClientRect().height);
-        if (target === headerEl) setHeaderH(h);
-        else if (target === footerEl) setFooterH(h);
+        if (target === headerEl) {
+          const r = target.getBoundingClientRect();
+          setColRect({ left: Math.round(r.left), width: Math.round(r.width) });
+        } else if (target === footerEl) {
+          const bbs = entry.borderBoxSize;
+          const box = bbs ? (Array.isArray(bbs) ? bbs[0] : bbs) : null; // 规范是数组,老实现/polyfill 可能给单个对象
+          const h = box ? Math.round(box.blockSize) : Math.round(target.getBoundingClientRect().height);
+          setFooterH(h);
+        }
       }
     });
     ro.observe(headerEl, { box: 'border-box' });
     ro.observe(footerEl, { box: 'border-box' });
     return () => ro.disconnect();
-  }, [mode]);
+  }, [mode, topEl, bottomEl]);
+  // 浮窗/横幅共用的水平定位:测量未就绪的首帧先不显示(全宽回退会盖住侧廊)
+  const panelX: React.CSSProperties = colRect ? { left: colRect.left, width: colRect.width } : { left: 0, right: 0, visibility: 'hidden' };
 
   const loadWindow = useCallback(async (id: string, gentle = false, expectGen?: number): Promise<void> => {
     if (expectGen !== undefined && expectGen !== genRef.current) return; // 调用前置检查:发起前世界已经翻篇,不用打这一枪
@@ -1124,8 +1181,14 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   async function enterWindow(id: string) {
     await abortActiveStream();
     genRef.current++;
+    // 换窗这条路不走 resetBoardState(下面几行是它自己摊开的另一套复位),状态板重算在飞
+    // 同样要在这里单独收口——不然挂死的请求会把锁焊死在旧窗上,新窗打开面板都点不动。
+    abortBoardRefreshIfFlying();
     sendingRef.current = false;
     pinnedRef.current = true; // 换窗=新对话从底部看起,清掉上一扇窗残留的解钉状态
+    pendingEnterScrollRef.current = true; // 楼层真值首批到达时绘制前落底(确定性通道,见声明处)
+    setFloorVisibleCount(FLOOR_VISIBLE_INIT); // 渲染窗回初值:上一扇窗展开过的窗口别带进新窗
+    expandAnchorRef.current = null; // 上一扇窗残留的展开锚作废
     setSending(false);
     setTurnKind(null);
     setDeskError('');
@@ -1190,6 +1253,9 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     setCurWindowId(null);
     curWindowIdRef.current = null;
     setWin(null); setFloors([]);
+    // 两屏共用滚动区,回列表回顶;window 一并归零收拾 Safari 键盘态留下的偏移。
+    scrollEl?.scrollTo(0, 0);
+    window.scrollTo(0, 0);
     setWinNonce((n) => n + 1); // 回列表时顺手刷新一次(楼层数/updated_at 可能变了)
   }
 
@@ -1248,17 +1314,71 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 补间误判成"用户翻上去了"当场解钉;'auto' 同步落底,监听器读到的永远是贴底位置。
   // 内容增高本身不触发 scroll 事件,所以钉/解钉只会由真实滚动(用户或瞬滚落底)驱动,不会自激。
   const pinnedRef = useRef(true);
-  // ⚠️耳朵挂在写作屏 <main> 的 onScroll 上,不是 window——应用壳化后滚动发生在壳内那层
-  // overflow-y-auto 的 <main>,window 根本不滚。首发挂错了窗户(window 监听器永远不响,pinned
-  // 恒 true,钉底形同虚设),这是实测"打字桌不行、别处ok"抓出来的差异:别处没壳化、真滚窗口,所以好使。
-  const onScrollerScroll = (e: React.UIEvent<HTMLElement>) => {
-    const el = e.currentTarget;
-    pinnedRef.current = el.scrollHeight - el.clientHeight - el.scrollTop < 120;
+  // ⚠️耳朵必须跟滚动主体住同一扇窗(现为壳的 scrollEl)。
+  useEffect(() => {
+    if (!scrollEl) return;
+    const onScroll = () => {
+      pinnedRef.current = scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop < 120;
+    };
+    scrollEl.addEventListener('scroll', onScroll, { passive: true });
+    return () => scrollEl.removeEventListener('scroll', onScroll);
+  }, [scrollEl]);
+  // 选字保护:钉底跟滚每来一块流就把视口拽到底,选区立不住。只要(a)主键按着、拖选起手于
+  // 对话区,或(b)未塌陷选区还留在对话区里,这一轮跟滚就先憋着,并立 scrollSuppressed 旗;
+  // 选区清掉/抬手时由 selectionchange/pointerup 侦听补一脚落底(不能指望"下一次 floors 更新"
+  // 来恢复——流式收完后可能再也没有更新,跟滚会一直躺着装死)。
+  const scrollerRef = useRef<HTMLElement | null>(null);
+  const dragSelectingRef = useRef(false);
+  const scrollSuppressedRef = useRef(false);
+  // 长按手势宽限窗:pointercancel 到选区立起来之间有空窗,宽限期必须是所有落底路径
+  // (定时复查+floors 效果)共认的一块表,只延迟事件收尾会被流式分块绕过。
+  const selectGraceUntilRef = useRef(0);
+  const selectionInScroller = () => {
+    const el = scrollerRef.current;
+    if (!el) return false;
+    const sel = window.getSelection();
+    return !!sel && !sel.isCollapsed && !!sel.anchorNode && el.contains(sel.anchorNode);
   };
   useEffect(() => {
+    const maybeResume = () => {
+      if (!scrollSuppressedRef.current) return;
+      if (!pinnedRef.current) { scrollSuppressedRef.current = false; return; } // 人自己翻上去了=解钉,旗子作废
+      if (dragSelectingRef.current || selectionInScroller()) return; // 还在选,继续憋
+      if (Date.now() < selectGraceUntilRef.current) return; // 手势宽限期内,等定时器最终复查
+      scrollSuppressedRef.current = false;
+      scrollToDocBottom();
+    };
+    // 长按被认成选字手势的瞬间会发 pointercancel,此时选区还没立起来——立刻收尾会在
+    // "没选区"的窗口期落底杀掉手势,所以压 600ms 再复查;普通点按只是落底晚半秒,无感。
+    let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleResume = () => {
+      selectGraceUntilRef.current = Date.now() + 600;
+      if (resumeTimer !== null) clearTimeout(resumeTimer);
+      // 定时器是宽限窗唯一的"最终复查":先把窗关上再问 maybeResume,选区真立住了它自会继续憋着
+      resumeTimer = setTimeout(() => { resumeTimer = null; selectGraceUntilRef.current = 0; maybeResume(); }, 600);
+    };
+    const up = () => { dragSelectingRef.current = false; scheduleResume(); };
+    const onSelChange = () => scheduleResume();
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+    document.addEventListener('selectionchange', onSelChange);
+    return () => {
+      if (resumeTimer !== null) clearTimeout(resumeTimer);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+      document.removeEventListener('selectionchange', onSelChange);
+    };
+    // scrollToDocBottom 进依赖:槽位首帧为 null,不重挂会捂住旧闭包。
+  }, [scrollToDocBottom]);
+  // 钉底跟滚用 layout effect(绘制前):满窗后发送会把顶部楼层挤出渲染窗,挤出与落底必须在
+  // 同一帧完成,否则会先画一帧"顶上没了、还停在旧滚动位"的错位画面;守卫全是同步检查,层无差别。
+  useLayoutEffect(() => {
     if (!pinnedRef.current) return;
-    bottomRef.current?.scrollIntoView({ behavior: 'auto' });
-  }, [floors]);
+    // 宽限窗内的流式分块同样要让路:"长按到一半来了一块流"正是主场景
+    if (dragSelectingRef.current || selectionInScroller() || Date.now() < selectGraceUntilRef.current) { scrollSuppressedRef.current = true; return; }
+    scrollSuppressedRef.current = false;
+    scrollToDocBottom();
+  }, [floors, scrollEl, scrollToDocBottom]);
 
   // ── composer 草稿:按窗口分槽存 localStorage ──
   const [input, setInput] = useState('');
@@ -1405,6 +1525,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     onUserSaved?: (id: string) => void;
     onText?: (t: string) => void;
     onThinking?: (t: string) => void;
+    onStatus?: (t: string) => void; // 服务端收尾阶段的进度话(如状态板自动补算),done 前显示
   }, signal?: AbortSignal): Promise<StreamOutcome> {
     let res: Response;
     try {
@@ -1449,6 +1570,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
           if (e.type === 'user_saved') handlers.onUserSaved?.(e.id);
           else if (e.type === 'text') handlers.onText?.(e.text);
           else if (e.type === 'thinking') handlers.onThinking?.(e.text);
+          else if (e.type === 'status') handlers.onStatus?.(String(e.text || ''));
           else if (e.type === 'done') return { done: true, floorId: e.id };
           else if (e.type === 'error') return { error: e.error || '出错了' };
           // ping/usage 不用管:打字桌没有额度面板,desk 手套零工具也不会吐 tool 事件
@@ -1466,6 +1588,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // ── ①普通发送 ──
   const [sending, setSendingState] = useState(false);
   function setSending(v: boolean) { setSendingState(v); }
+  const [streamStatus, setStreamStatus] = useState(''); // 服务端 status 事件(收尾进度话),轮次结束清空
   // FIX1:composer/草稿在 user_saved 事件真正到达前不清——那才是后端把用户这楼落库的
   // 时刻(见 chat/desk.ts pumpVps「mode==='normal' 就先 send user_saved」)。user_saved 之前但凡失败,
   // 把刚才提交的字连本带利还回composer+这扇窗的草稿槽,一个字都不许丢。
@@ -1525,6 +1648,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
         },
         onText: (t) => patchFloor(myGen, asgKey, (f) => ({ ...f, content: f.content + t })),
         onThinking: (t) => patchFloor(myGen, asgKey, (f) => ({ ...f, thinking: (f.thinking || '') + t })),
+        onStatus: (t) => { if (myGen === genRef.current) setStreamStatus(t); },
       }, ac.signal);
       if (abortRef.current === ac) abortRef.current = null;
 
@@ -1564,7 +1688,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
         }
       }
 
-      if (myGen === genRef.current) { setSending(false); setTurnKind(null); }
+      if (myGen === genRef.current) { setSending(false); setTurnKind(null); setStreamStatus(''); }
       sendingRef.current = false;
     })();
     pendingRef.current = turn;
@@ -1611,6 +1735,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       const outcome = await streamChat({ window_id: windowId, roll: true, channel: 'vps', model }, {
         onText: (t) => patchFloor(myGen, f.key, (fl) => ({ ...fl, content: fl.content + t })),
         onThinking: (t) => patchFloor(myGen, f.key, (fl) => ({ ...fl, thinking: (fl.thinking || '') + t })),
+        onStatus: (t) => { if (myGen === genRef.current) setStreamStatus(t); },
       }, ac.signal);
       if (abortRef.current === ac) abortRef.current = null;
 
@@ -1636,7 +1761,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
         }
       }
       floorSnapshotRef.current = null;
-      if (myGen === genRef.current) { setSending(false); setTurnKind(null); }
+      if (myGen === genRef.current) { setSending(false); setTurnKind(null); setStreamStatus(''); }
       sendingRef.current = false;
     })();
     pendingRef.current = turn;
@@ -1646,6 +1771,10 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
 
   // ── 楼层就地编辑(铅笔→行内 textarea→PUT /floors/:id) ──
   const [editingFloorKey, setEditingFloorKey] = useState<string | null>(null);
+  // 实时镜像:状态板重算落地(await 之后)要再确认一遍"此刻"有没有编辑框开着——发起那一刻的
+  // editingFloorKey 闭包值早就定死,靠不住,同 boardDirtyRef 等镜像同款理由。
+  const editingFloorKeyRef = useRef<string | null>(null);
+  useEffect(() => { editingFloorKeyRef.current = editingFloorKey; }, [editingFloorKey]);
   const [editDraft, setEditDraft] = useState('');
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState('');
@@ -1656,6 +1785,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 各自textarea的onInput——不再让grow()挂在render期的inline callback ref上反复重跑
   // (原因见grow()头注释)。
   const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // 开框前滚动位快照:textarea 首帧两行、长楼塌陷会被夹进滚动位,撑高后按回去。
+  const editScrollAnchorRef = useRef<number | null>(null);
   // ⚠️聚焦这件事自己接管,不用 <textarea autoFocus>(iPad 实测:点「编辑」的瞬间
   // 整页刷成空白、要往下滑才重新看见气泡)。autoFocus 走的是"挂载即 focus()",而 focus() 默认
   // **会把元素滚进视野**;iOS 上软键盘同时弹起、可视视口高度骤变,这一脚滚动经常滚飞,
@@ -1665,10 +1796,19 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   useLayoutEffect(() => {
     if (editingFloorKey === null) return;
     const el = editTextareaRef.current;
-    if (!el) return;
-    grow(el);
+    if (!el || !scrollEl) return; // ⚠️先确认 scrollEl 存在再消费一次性编辑锚
+    // ⚠️编辑框不封顶、按内容自然撑高:240px 小框换掉长楼=脚下抽空
+    grow(el, false, Number.POSITIVE_INFINITY);
+    const anchor = editScrollAnchorRef.current;
+    editScrollAnchorRef.current = null;
+    if (anchor !== null) scrollEl.scrollTo({ top: clampScrollTop(anchor), behavior: 'auto' }); // 撑高后按回开框前的滚动位
     try { el.focus({ preventScroll: true }); } catch { el.focus(); }
-    el.scrollIntoView({ block: 'nearest' });
+    // ⚠️只在框子整个滚出滚动区时才 nearest:框子比滚动区高时 nearest 会把顶边拽到视口顶。
+    const r0 = el.getBoundingClientRect();
+    const scrollRect0 = scrollEl?.getBoundingClientRect();
+    const scrollTop0 = scrollRect0 ? scrollRect0.top : 0;
+    const scrollBottom0 = scrollRect0 ? scrollRect0.bottom : window.innerHeight;
+    if (r0.bottom < scrollTop0 || r0.top > scrollBottom0) el.scrollIntoView({ block: 'nearest' });
     // 键盘弹起之后还要再判一次遮挡(实测:现在不弹飞了,但编辑框不跟着输入法一起挪上来,
     // 得先收一次输入法、再点框子才对)。原因是 preventScroll 顺手也掐掉了浏览器"把聚焦元素
     // 让开键盘"那套内建行为,而 scrollIntoView 算的是**布局视口**——iOS 上布局视口不随键盘
@@ -1687,7 +1827,16 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     const check = () => {
       if (done) return;
       const r = el.getBoundingClientRect();
-      const visibleBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+      // visualViewport 是 window 坐标,可见区须与壳滚动区矩形取交集。
+      const scrollRect = scrollEl?.getBoundingClientRect();
+      let visibleTop = vv ? vv.offsetTop : 0;
+      let visibleBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+      if (scrollRect) {
+        visibleTop = Math.max(visibleTop, scrollRect.top);
+        visibleBottom = Math.min(visibleBottom, scrollRect.bottom);
+      }
+      if (r.height > visibleBottom - visibleTop) return; // 比可视区还高的框装不进视口,居中它=一脚大跳
+
       // 真被挡住了才滚;没挡住一动不动——她手动点框子那条路本来就正常,别去干扰
       if (r.bottom > visibleBottom - 8) el.scrollIntoView({ block: 'center' });
     };
@@ -1711,7 +1860,13 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       if (backstop) clearTimeout(backstop);
       vv?.removeEventListener('resize', onResize);
     };
-  }, [editingFloorKey]);
+  }, [editingFloorKey, scrollEl, clampScrollTop]);
+  // 越底钳回(绘制前):内容缩到滚动位之下时同帧钳回底,不越界不动。
+  useLayoutEffect(() => {
+    if (!scrollEl) return;
+    const top = docBottomTop();
+    if (scrollEl.scrollTop > top + 1) scrollEl.scrollTo({ top, behavior: 'auto' });
+  }, [floors, editingFloorKey, floorVisibleCount, scrollEl, docBottomTop]);
   // user楼编辑保存=回退重发新增状态:
   // - editRegenStage/editRegenTimers:二段确认家法,照 winDelStage/boardCloseStage
   //   同款"点一次亮警告文案,3秒内再点一次才真的执行"套路,不新开弹窗体系——只有"这楼是user楼
@@ -1725,6 +1880,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   function startFloorEdit(f: Floor) {
     if (sendingRef.current || !f.id || editingFloorKey !== null) return;
     if (mutRef.current > 0) return; // 改楼在飞时不许开编辑框:切变体半路开编辑抓的是旧content,存回去=覆盖新变体
+    editScrollAnchorRef.current = scrollEl?.scrollTop ?? null; // 开框滚动位快照(见声明处)
     setEditingFloorKey(f.key);
     setEditDraft(f.content);
     setEditError('');
@@ -2095,8 +2251,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       .filter((t) => t.trim()); // 判空用 trim,留下来的原文不动
     return pieces.join('\n\n');
   }
-  // 本机时区(=亚特兰大,她的浏览器就在那儿)。刻意不用 toLocaleString:各浏览器的 locale 默认格式
-  // 不一样,导出的档案格式该是稳定的,不该取决于她今天用哪个浏览器打开。
+  // 本机时区。刻意不用 toLocaleString:各浏览器的 locale 默认格式
+  // 不一样,导出的档案格式该是稳定的,不该取决于用哪个浏览器打开。
   function stampOf(iso?: string): string {
     if (!iso) return '';
     const d = new Date(iso);
@@ -2314,12 +2470,16 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   const boardSavingRef = useRef(false);
   const [boardError, setBoardError] = useState('');
   const [boardArm, setBoardArm] = useState<string | null>(null);
-  // 🔄 状态板刷新:按最后一楼**改过之后的**正文重算一份板,填进草稿等她确认。
+  // 🔄 状态板刷新:按最近一条 AI 楼**改过之后的**正文重算一份板,填进草稿等她确认。
   // refreshArm 是"会盖掉草稿,再点一次"的两段确认——只在草稿脏的时候才需要问;
   // boardRefreshingRef 跟 boardSavingRef 同款:互斥闸必须读 ref 不读 state(setState 不同步落到
   // 当前闭包,同一 tick 双击就穿了),state 只管按钮文案/disabled。
   const [boardRefreshing, setBoardRefreshing] = useState(false);
   const boardRefreshingRef = useRef(false);
+  // 请求本体的中止句柄:关面板/切窗/离窗这些"作废方"不能只指望在飞的 fetch 自己迟早落地——
+  // 请求真挂死(网络卡住、连接不断)就只有 abort() 能强制收口,不然 boardRefreshingRef/
+  // boardRefreshing 会卡 true 到天荒地老,草稿控件/保存/再点重算全被锁死,只能刷新页面。
+  const boardRefreshAbortRef = useRef<AbortController | null>(null);
   const [refreshArm, setRefreshArm] = useState(false);
   const refreshArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [boardRefreshNotice, setBoardRefreshNotice] = useState('');
@@ -2345,11 +2505,41 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 底下地基换了"这两种情况)。
   const boardBaseRef = useRef<string>('{}');
   const [boardConflict, setBoardConflict] = useState(false);
+  // 草稿修订号:每次 setBoardDraft/草稿结构变一次就 +1(输入框改字/增删行/子行编辑/开面板拍
+  // 快照/重算灌新板,全算一次修订)。refreshBoard 发起时拍下当时的号,响应落地时如果号已经变了,
+  // 说明这段等待期间她已经又动过草稿(哪怕 UI disabled 也可能是事件排队在先),这份结果不许覆盖
+  // 她刚打的字,原样丢弃——跟世界代数/刷新令牌/楼层对账/编辑态那四道闸并列的第五道。
+  const boardDraftRevRef = useRef(0);
   // 时光带是顶栏独立浮窗（排在导演小纸条之前）。rev 是后台折叠的乐观锁；保存时服务端会拒绝
   // 基于旧 rev 的草稿，避免生成收尾恰好新增一段时把手改内容静默盖来盖去。
   const [timelineOpen, setTimelineOpen] = useState(false);
   // 🌍 世界书浮窗。它和时光带/状态板同一族互斥,见 toggleLorePanel。
   const [loreOpen, setLoreOpen] = useState(false);
+  // 浮窗/横幅的 top=头栏视口下边缘(窄屏含横廊高度,≠头栏高度);头栏不随 scrollEl 滚,在开面板/
+  // 头栏尺寸变时量;window 与 visualViewport 的 scroll/resize 也要量——iOS 会推 window 位移而头栏尺寸不变。
+  const [headerBottom, setHeaderBottom] = useState(64);
+  const anyOverlayOpen = loreOpen || timelineOpen || boardOpen || noteOpen || !!deskError;
+  useEffect(() => {
+    if (mode !== 'write' || !anyOverlayOpen) return;
+    const el = headerRef.current;
+    if (!el) return;
+    const update = () => setHeaderBottom(Math.max(0, Math.round(el.getBoundingClientRect().bottom)));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    const vv = window.visualViewport;
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, { passive: true });
+    vv?.addEventListener('resize', update);
+    vv?.addEventListener('scroll', update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update);
+      vv?.removeEventListener('resize', update);
+      vv?.removeEventListener('scroll', update);
+    };
+  }, [mode, anyOverlayOpen, topEl]); // topEl 进依赖:槽位就绪后才有 headerRef
   // ⚠️loreOpenRef 不是冗余:离窗协议 requestLeave 挂在 useImperativeHandle(...,[])
   // 上,闭包永远停在首帧——那里读 loreOpen 这个 state 永远是 false,左廊切门/「家」链接这两条
   // 出口上的世界书保护会整个失效。同族的 boardDirtyRef/timelineDirtyRef 当初就是为这个立的。
@@ -2478,24 +2668,31 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   }
   function toggleBoardPanel() {
     if (boardOpen) { closeBoardPanel(); return; }
+    openBoardPanel();
+  }
+  // 开状态板面板;被别的浮窗的脏草稿拦下时返回 false(楼层动作条的「重算」钮要靠这个返回值
+  // 决定接不接着刷,见 refreshBoardForVariant)
+  function openBoardPanel(): boolean {
     // 先全问(世界书 → 时光带 → 小纸条),都点头了才动手
-    if (!loreGate('board')) return;
-    if (timelineOpen && !boardGate('board')) return;
+    if (!loreGate('board')) return false;
+    if (timelineOpen && !boardGate('board')) return false;
     if (noteOpen) {
       const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth ?? 3);
-      if (noteDirty) { setNoteError('先保存或取消小纸条，再打开状态板'); return; }
+      if (noteDirty) { setNoteError('先保存或取消小纸条，再打开状态板'); return false; }
     }
     resetLoreState();
     if (timelineOpen) resetBoardState();
     setNoteOpen(false);
     const board = win?.state_board || {};
     setBoardDraft(boardToRows(board));
+    boardDraftRevRef.current++;
     boardBaseRef.current = JSON.stringify(board);
     boardDirtyRef.current = false; boardArmRef.current = null;
     setBoardDirty(false); setBoardError(''); setBoardArm(null); setBoardConflict(false);
     boardRefreshSeqRef.current++; // 开面板也拨一次号:上一轮在飞的刷新不许灌进这一轮的草稿
     clearBoardRefreshArm();
     setBoardOpen(true);
+    return true;
   }
   // 🌍 世界书浮窗:跟时光带/状态板同一族互斥——同一时刻顶栏只开一扇。
   // 开它之前照规矩问一句别的窗有没有没存的东西,不然一点「世」就把她的板/带草稿盖没了;
@@ -2537,6 +2734,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   function viewNewBoard() {
     const board = win?.state_board || {};
     setBoardDraft(boardToRows(board));
+    boardDraftRevRef.current++;
     boardBaseRef.current = JSON.stringify(board);
     boardDirtyRef.current = false;
     setBoardDirty(false); setBoardError(''); setBoardConflict(false);
@@ -2551,6 +2749,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (cur === boardBaseRef.current) return; // 没变,跟基线一致,不用理
     if (!boardDirty) {
       setBoardDraft(boardToRows(win.state_board || {}));
+      boardDraftRevRef.current++;
       boardBaseRef.current = cur;
       setBoardConflict(false);
     } else {
@@ -2593,15 +2792,35 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     }
     return true;
   }
+  // 重算在飞时被关面板/切窗/离窗这些"作废方"截断:abort 请求本体+就地把锁放掉,不等被
+  // abort 的 fetch 自己绕一圈 catch→finally 回来放锁(那样在"请求真挂死,abort 都等不到
+  // 网络层响应"这种情况下会永远等不到,boardRefreshingRef/boardRefreshing 卡 true 到天荒
+  // 地老)。谁调用这个函数,谁就是这一刻的"作废方",直接同步释放+把 boardRefreshAbortRef
+  // 置空,refreshBoard 自己的 finally 稍后落地时会认 controller 身份(见 boardRefreshAbortRef.
+  // current===ac 那道判定——不能认 boardRefreshSeqRef 令牌,那个号楼层一动就会被业务路径
+  // 顺带拨旧,跟"是不是真的被 abort 过"是两件事)识出自己已经不是所有者,不会再动一次
+  // (也不会误抢一趟新起的重算的锁)。
+  function abortBoardRefreshIfFlying() {
+    if (boardRefreshAbortRef.current) {
+      boardRefreshAbortRef.current.abort();
+      boardRefreshAbortRef.current = null;
+    }
+    if (boardRefreshingRef.current) {
+      boardRefreshingRef.current = false;
+      setBoardRefreshing(false);
+    }
+  }
   function resetBoardState() {
     if (boardCloseTimer.current) { clearTimeout(boardCloseTimer.current); boardCloseTimer.current = null; }
     boardArmRef.current = null; boardDirtyRef.current = false; timelineDirtyRef.current = false;
     setBoardArm(null); setBoardDirty(false); setTimelineDirty(false); setBoardError(''); setTimelineError('');
     setBoardOpen(false); setTimelineOpen(false);
     // 刷新那套跟着一起收:①确认标记不许跨面板生命周期活下来 ②在飞的刷新响应
-    // 作废——否则它回来会往一块已经关掉的面板里灌草稿+标脏,变成看不见的脏位。
+    // 作废——否则它回来会往一块已经关掉的面板里灌草稿+标脏,变成看不见的脏位。③请求本体
+    // 也一并 abort+就地解锁(见 abortBoardRefreshIfFlying 声明处),不然挂死的请求会把锁焊死。
     boardRefreshSeqRef.current++;
     clearBoardRefreshArm();
+    abortBoardRefreshIfFlying();
   }
   // 给"状态板/时光带是这一路唯一一道闸"的入口用(两块面板自己的关闭钮)
   function requestBoardPanelClose(action = 'close'): boolean {
@@ -2651,6 +2870,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     // (rawKind==='object' 的行没有这个函数的调用点——它没有顶层value输入框,值全在subRows里。)
     setBoardDraft((rows) => rows.map((r, idx) => (idx === i ? { ...r, value, touched: true } : r)));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function updateBoardRowKey(i: number, key: string) {
     // 改键名不置 touched:这里的 touched 管的是"值要不要被字符串化",键名是独立维度——保存时
@@ -2658,16 +2878,19 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     // 所以重命名从来不需要额外动 touched,也就不会误伤"没碰过就原样吐回"这条铁律。
     setBoardDraft((rows) => rows.map((r, idx) => (idx === i ? { ...r, key, keyTouched: true } : r)));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function addBoardRow() {
     // 新行没有"原样"可言,直接当已touched的纯字符串处理
     setBoardDraft((rows) => [...rows, { id: genBoardRowId(), key: '', value: '', rawKind: 'string', raw: '', touched: true, keyTouched: true, protocolLocked: false }]);
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function removeBoardRow(i: number) {
     // 单键小×直接从草稿摘掉,不用两段——"保存"之前这一切都只是草稿,真正落库的动作只有保存本身
     setBoardDraft((rows) => rows.filter((_, idx) => idx !== i));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   // ── object行的子行操作(任务点1-6):四个函数分工跟顶层 updateBoardRowValue/Key/add/removeBoardRow
   // 严格对应,多一件事——每次子行结构变化都要把外层 row.touched 一并拨成 true(见类型声明处大
@@ -2675,7 +2898,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // 把她刚改的子行原样吐回去当没发生过)。rowIndex 用来定位是哪个顶层object行,subIndex 定位
   // 是它下面第几个子行,两层下标而不是嵌套查id,道理跟顶层一致——数组顺序全程只增删不重排,
   // 下标天然稳定,不需要额外一层id查找。
-  // 🔄 按最后一楼(改过之后的)正文重算状态板。后端只回不写(见 chat/deskBoardRefresh.ts 头注释),
+  // 🔄 按最近一条 AI 楼(改过之后的)正文重算状态板。后端只回不写(见 chat/deskBoardRefresh.ts 头注释),
   // 这里把回来的板灌进草稿并标脏——落库仍然是她点「保存状态板」那一下。
   async function refreshBoard() {
     if (!curWindowId) return;
@@ -2683,6 +2906,10 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (boardRefreshingRef.current) return;
     if (boardSavingRef.current) { setBoardError('状态板保存中,稍等一两秒再刷新'); return; }
     if (sendingRef.current) { setBoardError('生成中,状态板锁定——这楼模型自己末尾要写板,两边会打架'); return; }
+    // 楼层动作条那颗「重算」钮已经把这两道拦在按钮 disabled 里,面板内这颗「↻ 按正文重算」原来
+    // 没查——编辑框开着时后端还是按旧落库正文算板,floor_id 照样对得上,落下去就是板跟正文不一致。
+    if (editingFloorKey !== null) { setBoardError('有楼层正在编辑中——先保存或取消,再重算状态板'); return; }
+    if (mutRef.current > 0) { setBoardError('有改动正在保存,稍等一两秒再重算'); return; }
     // 有没保存的草稿就先问一句:刷新会整份盖掉她手上的改动
     if (boardDirtyRef.current && !refreshArm) {
       setRefreshArm(true);
@@ -2696,10 +2923,15 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     const savedWindowId = curWindowId;
     const myGen = genRef.current;
     const myTok = ++boardRefreshSeqRef.current;
+    const myDraftRev = boardDraftRevRef.current; // 发起这一刻的草稿版本,落地时用来问"这段等待期间她是不是又动过草稿"
+    // 请求本体可中止:关面板/切窗/离窗这些"作废方"会调 abortBoardRefreshIfFlying() 强行截断
+    // 这个 controller,不用等它自己(可能挂死到永远)落地才解锁——见该函数声明处注释。
+    const ac = new AbortController();
+    boardRefreshAbortRef.current = ac;
     boardRefreshingRef.current = true;
     setBoardRefreshing(true); setBoardError(''); setBoardRefreshNotice('');
     try {
-      const res = await fetch(`${base}/api/oc/desk/windows/${savedWindowId}/board-refresh`, { method: 'POST' });
+      const res = await fetch(`${base}/api/oc/desk/windows/${savedWindowId}/board-refresh`, { method: 'POST', signal: ac.signal });
       const d = await res.json().catch(() => null);
       if (!res.ok || !d || d.success !== true) throw new Error(d?.error || '重算失败(服务端没确认成功)');
       const nextBoard = d.board;
@@ -2717,30 +2949,71 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       // ⚠️严格相等,不许拿 `lastFloor.id &&` 把 undefined 放过去:没有 id = 这一楼还在
       // 流式生成、没落库——那**恰恰是**必须作废的冲突态,不是"没法判断所以放行"。能当刷新基准的
       // 楼层本来就该有 id;没有 id 就证明不了它还是后端算这份板时依据的那一楼。
-      const lastFloor = floorsRef.current[floorsRef.current.length - 1];
+      // 对账对象=最近一条 AI 楼(后端同口径:board-refresh 跳过尾随的孤儿 user 楼,不算数——
+      // 生成失败留下孤儿 user 楼时,拿数组字面最后一楼对账会把后端算对的结果误判成"楼层变了")。
+      const lastFloor = [...floorsRef.current].reverse().find((x) => x.role === 'assistant');
       if (!lastFloor || lastFloor.id !== d.floor_id) {
         setBoardRefreshNotice('刷的这会儿楼层变了,这份是照旧的那楼算的,已经丢掉——再按一次');
         return;
       }
+      // ④编辑态兜底:入口那道闸挡的是"发起这一下",飞行中她仍可能点开编辑框(未保存)——落地这一刻
+      // 用实时 ref(不是 state 闭包,同上面 editingFloorKeyRef 声明处理由)再问一遍,有就整份丢弃,
+      // 不落草稿。mutRef 同理读活的。
+      if (editingFloorKeyRef.current !== null || mutRef.current > 0) {
+        setBoardRefreshNotice('这份重算飞行中楼层编辑开了/有改动在保存,跟正文对不上——已丢弃,先保存或取消再重按一次');
+        return;
+      }
+      // ⑤草稿修订号:落地前最后一问——这段等待期间她是不是已经又动过草稿(boardDraftRevRef 变了,
+      // UI 虽已 disabled 但事件可能排在禁用生效之前),或者一趟保存已经在飞/刚接管(boardSavingRef
+      // 现在为真,saveBoard 入口虽然已经拒绝"重算中起新保存",但这里读的是发起之后任意时刻的活值,
+      // 兜的是"保存先起飞、比这次重算的入口检查还早"那类顺序)。命中就整份丢弃,不落草稿,不清脏位——
+      // 不然无条件 setBoardDraft 会静默盖掉她这几十秒里的手改,"重算先落地、保存后落地"还会把
+      // boardDirty 清成 false,但屏上摆着的是重算产生、从没落库的板。
+      if (boardDraftRevRef.current !== myDraftRev || boardSavingRef.current) {
+        setBoardRefreshNotice('重算期间草稿改过/已保存,这份丢掉——再按一次');
+        return;
+      }
       setBoardDraft(boardToRows(nextBoard));
+      boardDraftRevRef.current++;
       // ⚠️基线**不动**:boardBaseRef 记的是"这份草稿基于哪版已落库的板",而这次重算一个字都没落库。
       // 动了它会让冲突检测把"模型后来又写了新板"这件事看漏。
       boardDirtyRef.current = true;
       setBoardDirty(true);
-      setBoardRefreshNotice('已按最后一楼的正文重算,看一眼没问题再点保存');
+      setBoardRefreshNotice('已按最近一条 AI 楼的正文重算,看一眼没问题再点保存');
     } catch (e: any) {
+      // 主动 abort(关面板/切窗/离窗把这个 controller 掐了)不算错误——那是"作废方"主动收口,
+      // 不是请求本身失败,静默丢弃,不写 boardError 吓人。abortBoardRefreshIfFlying 那边已经
+      // 同步把锁放了,这里不用再补一次(finally 的 controller 身份判定也会认出自己已经不是所有者)。
+      if (e?.name === 'AbortError') return;
       // 失败分支也要过同样三道闸:否则"点刷新→关面板→重开→旧请求超时回来"会把
       // 上一轮的错误写进新面板,她一脸问号。静默丢弃就好,那一轮已经不属于现在这块面板了。
       if (curWindowIdRef.current !== savedWindowId || genRef.current !== myGen) return;
       if (myTok !== boardRefreshSeqRef.current) return;
       setBoardError(e.message || '重算失败');
     } finally {
-      // finally 不看令牌:顶上那道 `if (boardRefreshingRef.current) return` 是同步占锁的,
-      // 同一时刻只可能有一趟刷新在飞——所以走到这里的这一趟必然就是锁的主人,该它释放。
-      // 反过来若在这儿加令牌判断,楼层一动(令牌被拨新)就没人放锁了,按钮会永久变灰。
-      boardRefreshingRef.current = false;
-      setBoardRefreshing(false);
+      // 锁所有权按 controller 身份判,不按 myTok——boardRefreshSeqRef 这个号不是只有
+      // abortBoardRefreshIfFlying() 会拨,楼层一动(setFloors 那层包装,见其声明处注释)也会
+      // 无条件 ++,而重算飞行期间楼层编辑照样能开能存。若还按 myTok===boardRefreshSeqRef.current
+      // 判所有权:这趟重算没被真的 abort、只是令牌被业务路径捎带拨旧了,会被误判成"不是所有者"
+      // 而拒绝放锁——但 abortBoardRefreshIfFlying() 根本没被调用过,没人放过这把锁,于是
+      // boardRefreshingRef/boardRefreshing 卡死 true,只能关面板重开才能解套。controller 身份
+      // 才是这把锁真正的所有权凭证:abortBoardRefreshIfFlying() 放锁时会同步把 boardRefreshAbortRef
+      // 置空,所以被它作废的那趟进这里时 ref 早就不等于自己的 ac 了,不会顶掉后来者的锁;
+      // 而"只是令牌被拨旧、没人 abort"的这趟进来时 ref 仍是自己的 ac,照常放锁——令牌
+      // (myTok/boardRefreshSeqRef)只留给上面响应落地那几道对账用,不再掺和锁的所有权判定。
+      if (boardRefreshAbortRef.current === ac) {
+        boardRefreshAbortRef.current = null;
+        boardRefreshingRef.current = false;
+        setBoardRefreshing(false);
+      }
     }
+  }
+  // 楼层动作条上的「重算」钮:没开面板先开(openBoardPanel 被别的浮窗脏草稿拦下时返回 false,
+  // 这里跟着不刷),开了/已经开着就走同一颗刷新钮的路,板灌进草稿等她保存。面板已开且草稿脏,
+  // refreshBoard 自己会亮两段确认,这里不另起一套。
+  function refreshBoardForVariant() {
+    if (!boardOpen && !openBoardPanel()) return;
+    void refreshBoard();
   }
 
   function updateBoardSubRowValue(rowIndex: number, subIndex: number, value: string) {
@@ -2750,6 +3023,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       return { ...r, subRows, touched: true };
     }));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function updateBoardSubRowKey(rowIndex: number, subIndex: number, key: string) {
     // 子行改名一样不碰 sr.touched(同顶层 updateBoardRowKey 的道理:名字和值是独立维度),
@@ -2761,6 +3035,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       return { ...r, subRows, touched: true };
     }));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function addBoardSubRow(rowIndex: number) {
     setBoardDraft((rows) => rows.map((r, ri) => {
@@ -2769,6 +3044,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       return { ...r, subRows: [...r.subRows, newSub], touched: true };
     }));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   function removeBoardSubRow(rowIndex: number, subIndex: number) {
     setBoardDraft((rows) => rows.map((r, ri) => {
@@ -2776,6 +3052,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       return { ...r, subRows: r.subRows.filter((_, si) => si !== subIndex), touched: true };
     }));
     setBoardDirty(true);
+    boardDraftRevRef.current++;
   }
   // 子行删除双确认(家法照 onWinDeleteClick 抄:按id各开一档stage+一份计时器,3秒内点第二次
   // 才真删)。子行id全局唯一(见genBoardRowId),不同object行的子行也不会互相撞档。
@@ -2814,6 +3091,9 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     // (按钮文案/disabled),不参与互斥判断。
     if (boardSavingRef.current) { setBoardError('正在保存,请稍候'); return; }
     if (sendingRef.current) { setBoardError('生成中,状态板锁定'); return; }
+    // 重算在飞时点保存,"重算先落地、保存后落地"会把 boardDirty 清成 false,但屏上摆着的是重算
+    // 产生、从没落库的板——独占事务:重算和保存不许同时起飞,谁先起跑对面就等着。
+    if (boardRefreshingRef.current) { setBoardError('重算中,等它落地再保存'); return; }
     // PUT打的是这一刻的窗——捕获住,fetch落地时窗口可能已经切了(
     // 点了「← 窗口」切进另一扇窗,新窗加载先完成,这份旧响应才姗姗来迟)。世界代数双证:窗口id
     // (走 curWindowIdRef,理由见它声明处的注释——state闭包在await之后读到的是发起时的旧快照,
@@ -2948,12 +3228,10 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     // 全高子应用"——h-full 撑满 stage、overflow-hidden 兜住自己;头尾栏改 flex-none(不再需要
     // sticky——现在只有下面 <main> 自己滚,头尾栏本来就不在那段滚动区里,天然不动,不用靠sticky
     // 硬粘)。HeatBg 交给 page.tsx 那一份画,这里不重复画(两层纱罩叠加会变暗)。
-    return (
-      <div className="relative h-full flex flex-col bg-page text-ink-body overflow-hidden">
-        {/* 头栏 z-8(< 侧栏本体z-9,> 背板z-7)——原来这里是 sticky 年代留下的 z-10,
-            比侧栏本体(当时z-8)还高,侧栏打开时头栏会盖住侧栏顶端(关闭钮/本窗设置区点不到)。
-            归位到统一定序,见 DeskDrawers.tsx 侧栏本体 zIndex 声明处注释。 */}
-        <header ref={headerRef} className="flex-none z-[8] bg-page/85 backdrop-blur border-b border-line-soft px-6 py-3 max-[760px]:px-3.5 max-[760px]:pt-3 max-[760px]:pb-[11px]">
+    // 头栏 portal 进壳的顶槽(见 studyShell.tsx):z-8(< 侧栏本体z-9,> 背板z-7),
+    // 归位到统一定序,见 DeskDrawers.tsx 侧栏本体 zIndex 声明处注释。
+    const header = (
+      <header ref={headerRef} className="flex-none z-[8] bg-page/85 backdrop-blur border-b border-line-soft px-6 py-3 max-[760px]:px-3.5 max-[760px]:pt-3 max-[760px]:pb-[11px]">
           <div className="max-w-2xl mx-auto flex items-center justify-between gap-2">
             <div className="flex items-center gap-3 min-w-0">
               <button onClick={backToList} className="serc pill inline-flex items-center gap-2 text-sm text-ink-body bg-card border border-line-soft px-4 py-1.5 rounded-full whitespace-nowrap">← 返回</button>
@@ -3046,8 +3324,20 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
             </div>
           </div>
         </header>
+    );
 
-        <main onScroll={onScrollerScroll} className="relative z-[1] flex-1 overflow-y-auto px-6 py-8 max-[760px]:px-4">
+    return (
+      <div className="relative flex flex-col bg-page text-ink-body">
+        {topEl && createPortal(header, topEl)}
+
+        <main
+          ref={scrollerRef}
+          // 选字保护的(a)半边:主键在对话区按下即视为"可能在拖选",window 的 pointerup 统一清旗——
+          // 点按钮也会短暂立旗,但按下到抬起之间撞上一块流的概率毫秒级,无害。
+          // (ref 只当"选区在不在对话区"的包含判定根用,不是滚动容器——滚动主体是壳的 scrollEl)
+          onPointerDown={(e) => { if (e.button === 0) dragSelectingRef.current = true; }}
+          className="relative z-[1] px-6 py-8 max-[760px]:px-4"
+        >
           <div className="max-w-2xl mx-auto space-y-5">
             {winDelError && <div className="text-sm text-center" style={{ color: '#c2693f' }}>{winDelError}</div>}
             {/* 下行正则规则表拉取失败的一行淡提示——降级为无操作,不拦楼层照常读写(工单点2) */}
@@ -3065,7 +3355,22 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
               <div className="text-ink2 text-sm text-center py-10">这扇窗还空着～写下第一段吧</div>
             )}
 
-            {floors.map((f, floorIndex) => {
+            {floorOldCount > 0 && (
+              <div className="text-center">
+                <button
+                  onClick={() => {
+                    if (scrollEl) expandAnchorRef.current = { gen: genRef.current, gap: scrollEl.scrollHeight - scrollEl.scrollTop };
+                    setFloorVisibleCount((c) => c + FLOOR_VISIBLE_STEP);
+                  }}
+                  className="serc text-xs text-ink2 hover:text-accent bg-card border border-line-soft rounded-full px-4 py-1.5"
+                >
+                  ▾ 展开更早的楼层(还有 {floorOldCount} 楼)
+                </button>
+              </div>
+            )}
+
+            {visibleFloors.map((f, vi) => {
+              const floorIndex = floorOldCount + vi; // 楼层号按全量数组算,渲染窗滑动不许变号
               if (f.role === 'user') {
                 return (
                   <div key={f.key} className="flex flex-col items-end gap-1.5">
@@ -3073,7 +3378,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       <div className="w-[85%] space-y-2">
                         <textarea
                           value={editDraft} ref={editTextareaRef}
-                          onInput={(e) => grow(e.currentTarget, (e.nativeEvent as InputEvent).isComposing === true)}
+                          onInput={(e) => grow(e.currentTarget, (e.nativeEvent as InputEvent).isComposing === true, Number.POSITIVE_INFINITY)}
                           onChange={(e) => setEditDraft(e.target.value)}
                           onKeyDown={(e) => onFloorEditKeyDown(e, f)}
                           className="w-full resize-none rounded-[20px] border border-dashed border-dash-line bg-card px-4 py-2.5 text-ink-deep leading-relaxed focus:outline-none"
@@ -3089,7 +3394,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       </div>
                     ) : (
                       <>
-                        <div className="max-w-[80%] max-[760px]:max-w-[86%] rounded-[20px] rounded-br-[6px] bg-scale-1 text-ink-deep px-[18px] py-3.5 whitespace-pre-wrap leading-relaxed">
+                        <div className="max-w-[80%] max-[760px]:max-w-[86%] rounded-[20px] rounded-br-[6px] bg-scale-1 text-ink-deep px-[18px] py-3.5 wrap-hard whitespace-pre-wrap leading-relaxed">
                           {f.content}
                         </div>
                         <FloorActionRow
@@ -3176,7 +3481,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       <div className="w-full space-y-2">
                         <textarea
                           value={editDraft} ref={editTextareaRef}
-                          onInput={(e) => grow(e.currentTarget, (e.nativeEvent as InputEvent).isComposing === true)}
+                          onInput={(e) => grow(e.currentTarget, (e.nativeEvent as InputEvent).isComposing === true, Number.POSITIVE_INFINITY)}
                           onChange={(e) => setEditDraft(e.target.value)}
                           onKeyDown={(e) => onFloorEditKeyDown(e, f)}
                           className="w-full resize-none rounded-[20px] border border-dashed border-dash-line bg-card px-4 py-2.5 text-ink-body leading-relaxed focus:outline-none"
@@ -3191,7 +3496,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                         </div>
                       </div>
                     ) : !body && segments.length <= 1 ? (
-                      <div className="max-w-[85%] max-[760px]:max-w-[92%] rounded-[20px] rounded-bl-[6px] bg-card border border-line-soft shadow-sm text-ink-body px-[22px] py-4 whitespace-pre-wrap leading-[1.9]">
+                      <div className="max-w-[85%] max-[760px]:max-w-[92%] rounded-[20px] rounded-bl-[6px] bg-card border border-line-soft shadow-sm text-ink-body px-[22px] py-4 wrap-hard whitespace-pre-wrap leading-[1.9]">
                         <span className="text-ink2">{f.streaming ? '在写…' : ''}</span>
                       </div>
                     ) : (
@@ -3282,9 +3587,11 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                           ) : seg.text.trim() ? (
                             <div
                               key={`${f.key}-seg-${i}`}
-                              className="max-w-[85%] max-[760px]:max-w-[92%] rounded-[20px] rounded-bl-[6px] bg-card border border-line-soft shadow-sm text-ink-body px-[22px] py-4 whitespace-pre-wrap leading-[1.9]"
+                              className="max-w-[85%] max-[760px]:max-w-[92%] rounded-[20px] rounded-bl-[6px] bg-card border border-line-soft shadow-sm text-ink-body px-[22px] py-4 wrap-hard whitespace-pre-wrap leading-[1.9]"
                             >
-                              {seg.text}
+                              {/* 两态一律分块渲染保选区(为什么落库后也分块:见 chunkStreamText 头注释⚠️段) */}
+                              {/* display:contents:分块 span 不生成行内盒,排版与单段文字等价(实验:iOS 内滚区下多 span 选区不画蓝) */}
+                              {chunkStreamText(seg.text).map((c, ci) => <span key={ci} style={{ display: 'contents' }}>{c}</span>)}
                             </div>
                           ) : null
                         )}
@@ -3298,6 +3605,16 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       onEdit={startFloorEdit} onCopy={(t) => navigator.clipboard?.writeText(t)} onToggleReport={toggleReport}
                       extra={beautifyToggle}
                       isLast={isLast} onReroll={reroll}
+                      afterReroll={isLast && f.id ? (
+                        // 翻变体不动窗口板(每版没单独存板),按这颗当前正文重算一份状态板——只挂在最近一条
+                        // AI 楼上(重算接口只认这一楼),排在「重roll」和楼层号之间、就「重算」俩字
+                        <button
+                          disabled={sending || mutCount > 0 || editingFloorKey !== null || variantBusy[f.key] || boardRefreshing || boardSaving}
+                          onClick={refreshBoardForVariant}
+                          title="翻变体不会换状态板;按这一版的正文重算一份,填进状态板草稿等你保存"
+                          className="serc text-[11px] text-ink2 disabled:opacity-30 hover:text-accent"
+                        >{boardRefreshing ? '重算中…' : '重算'}</button>
+                      ) : undefined}
                     />
                   )}
 
@@ -3322,7 +3639,6 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                 </div>
               );
             })}
-            <div ref={bottomRef} />
           </div>
         </main>
 
@@ -3335,8 +3651,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
             头栏那几颗钮任何时候都得可点(同前面那套层级家法)。 */}
         {deskError && (
           <div
-            className="absolute left-0 right-0 z-[3] px-6 pt-3 max-[760px]:px-3.5 pointer-events-none"
-            style={{ top: headerH }}
+            className="fixed z-[3] px-6 pt-3 max-[760px]:px-3.5 pointer-events-none"
+            style={{ ...panelX, top: headerBottom }}
           >
             <div
               className="max-w-2xl mx-auto flex items-start gap-3 text-sm rounded-2xl border px-4 py-3 shadow-md pointer-events-auto"
@@ -3355,8 +3671,9 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
             base={base}
             envOk={envOk}
             project={win.project}
-            headerH={headerH}
+            topOffset={headerBottom}
             footerH={footerH}
+            panelX={panelX}
             onDirtyChange={setLoreDirty}
             onClose={requestLoreClose}
             closeArmed={loreArm === 'close'}
@@ -3366,8 +3683,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
         {/* 时光带独立浮窗：顺序排在导演小纸条前，不再挤进状态板。 */}
         {timelineOpen && (
           <div
-            className="absolute left-0 right-0 z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
-            style={{ top: headerH, maxHeight: `calc(100% - ${headerH}px - ${footerH}px)` }}
+            className="fixed z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
+            style={{ ...panelX, top: headerBottom, maxHeight: `calc(100dvh - ${headerBottom}px - ${footerH}px)` }}
           >
             <div className="max-w-2xl mx-auto">
               <div>
@@ -3443,8 +3760,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
           <div
             // 阴影朝上:shadow-sm 是向下投的,面板改成贴着底栏往上开之后那圈影子
             // 全落在底栏上、还被 z-[2] 的底栏盖掉,朝内容区的这条上沿等于秃的。
-            className="absolute left-0 right-0 z-[1] border-t border-line-soft bg-card shadow-[0_-2px_8px_var(--card-shadow)] px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
-            style={{ bottom: footerH, maxHeight: `calc(100% - ${headerH}px - ${footerH}px)` }}
+            className="fixed z-[1] border-t border-line-soft bg-card shadow-[0_-2px_8px_var(--card-shadow)] px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
+            style={{ ...panelX, bottom: footerH, maxHeight: `calc(100dvh - ${headerBottom}px - ${footerH}px)` }}
           >
             <div className="max-w-2xl mx-auto">
               <div className="serc text-sm text-ink-deep mb-2">导演小纸条</div>
@@ -3483,8 +3800,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
         {boardOpen && (
           // 同上(R3案二段):实底+定位+z-[1]双管齐下,理由与z校准见小纸条抽屉那段注释
           <div
-            className="absolute left-0 right-0 z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
-            style={{ top: headerH, maxHeight: `calc(100% - ${headerH}px - ${footerH}px)` }}
+            className="fixed z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
+            style={{ ...panelX, top: headerBottom, maxHeight: `calc(100dvh - ${headerBottom}px - ${footerH}px)` }}
           >
             <div className="max-w-2xl mx-auto">
               <div className="flex items-center justify-between gap-2 mb-2.5">
@@ -3499,8 +3816,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       别处的两段确认一个路子。 */}
                   <button
                     onClick={refreshBoard}
-                    disabled={sending || boardSaving || boardRefreshing}
-                    title="按最后一楼(改过之后的)正文重算一份状态板，填进草稿等你确认"
+                    disabled={sending || boardSaving || boardRefreshing || editingFloorKey !== null || mutCount > 0}
+                    title="按最近一条 AI 楼(改过之后的)正文重算一份状态板，填进草稿等你确认；后面跟着你的消息也能刷"
                     className="serc text-[11.5px] rounded-xl border px-3 py-1 disabled:opacity-40"
                     style={{
                       color: refreshArm ? '#c0573f' : 'var(--ink-body)',
@@ -3549,14 +3866,14 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                                   <input
                                     value={row.key}
                                     onChange={(e) => updateBoardRowKey(i, e.target.value)}
-                                    disabled={sending || boardSaving}
+                                    disabled={sending || boardSaving || boardRefreshing}
                                     className={keyInputCls}
                                   />
                                 )}
                                 <span className="flex-1 text-[11px] text-ink2">对象·{subRows.length}项(展开成子行编辑,见下)</span>
                                 <button
                                   onClick={() => removeBoardRow(i)}
-                                  disabled={sending || boardSaving}
+                                  disabled={sending || boardSaving || boardRefreshing}
                                   title="连这个键带下面所有子行一起删掉(保存前都是草稿)"
                                   className="shrink-0 leading-none text-[11px] text-ink2 hover:text-[#c2693f] disabled:opacity-30"
                                 >删整项</button>
@@ -3570,14 +3887,14 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                                         value={sr.key}
                                         onChange={(e) => updateBoardSubRowKey(i, si, e.target.value)}
                                         placeholder="键名"
-                                        disabled={sending || boardSaving}
+                                        disabled={sending || boardSaving || boardRefreshing}
                                         className={`serc w-20 flex-none rounded-lg border bg-page px-2 py-1 text-[11px] text-ink-body focus:outline-none disabled:opacity-50 ${subKeyBad ? 'border-[#c2693f]' : 'border-line-soft'}`}
                                       />
                                       <input
                                         value={sr.value}
                                         onChange={(e) => updateBoardSubRowValue(i, si, e.target.value)}
                                         placeholder="—"
-                                        disabled={sending || boardSaving}
+                                        disabled={sending || boardSaving || boardRefreshing}
                                         className="flex-1 min-w-0 rounded-lg border border-line-soft bg-page px-2 py-1 text-[11px] text-ink-body focus:outline-none disabled:opacity-50"
                                       />
                                       {/* 只展开一层(任务点6):子值本身还是对象/数组/数字/布尔/null——
@@ -3592,14 +3909,14 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                                       )}
                                       <button
                                         onClick={() => onBoardSubDeleteClick(i, si, sr.id)}
-                                        disabled={sending || boardSaving}
+                                        disabled={sending || boardSaving || boardRefreshing}
                                         title="删掉这一子行(保存前都是草稿)"
                                         className="shrink-0 leading-none text-[11px] text-ink2 hover:text-[#c2693f] disabled:opacity-30"
                                       >{boardSubDelStage[sr.id] === 1 ? '确定删?' : '删'}</button>
                                     </div>
                                   );
                                 })}
-                                <button onClick={() => addBoardSubRow(i)} disabled={sending || boardSaving} className="text-[11px] text-ink2 hover:text-ink-body disabled:opacity-40">＋加一子行</button>
+                                <button onClick={() => addBoardSubRow(i)} disabled={sending || boardSaving || boardRefreshing} className="text-[11px] text-ink2 hover:text-ink-body disabled:opacity-40">＋加一子行</button>
                               </div>
                             </div>
                           );
@@ -3613,7 +3930,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                                 value={row.key}
                                 onChange={(e) => updateBoardRowKey(i, e.target.value)}
                                 placeholder="键名"
-                                disabled={sending || boardSaving}
+                                disabled={sending || boardSaving || boardRefreshing}
                                 className={keyInputCls}
                               />
                             )}
@@ -3621,7 +3938,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                               value={row.value}
                               onChange={(e) => updateBoardRowValue(i, e.target.value)}
                               placeholder={row.rawKind === 'stringArray' ? '顿号、或逗号分隔多个' : '—'}
-                              disabled={sending || boardSaving}
+                              disabled={sending || boardSaving || boardRefreshing}
                               className="flex-1 min-w-0 rounded-lg border border-line-soft bg-page px-2 py-1 text-xs text-ink-body focus:outline-none disabled:opacity-50"
                             />
                             {/* 数字/布尔/null/混类型数组这类"非字符串原始值"显示成
@@ -3637,7 +3954,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                             )}
                             <button
                               onClick={() => removeBoardRow(i)}
-                              disabled={sending || boardSaving}
+                              disabled={sending || boardSaving || boardRefreshing}
                               title="删掉这一行(保存前都是草稿)"
                               className="shrink-0 leading-none text-xs text-ink2 hover:text-[#c2693f] disabled:opacity-30"
                             >删</button>
@@ -3647,7 +3964,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                       {!boardDraft.length && <div className="px-3 py-2 text-xs text-ink2">板子是空的,点"＋加一行"手动开一个键</div>}
                     </div>
                     <div className="flex items-center gap-3 mt-2.5 flex-wrap">
-                      <button onClick={addBoardRow} disabled={sending || boardSaving} className="text-xs text-ink2 hover:text-ink-body disabled:opacity-40">＋加一行</button>
+                      <button onClick={addBoardRow} disabled={sending || boardSaving || boardRefreshing} className="text-xs text-ink2 hover:text-ink-body disabled:opacity-40">＋加一行</button>
                       {boardHasKeyErrors && <span className="text-[11.5px]" style={{ color: '#c2693f' }}>有键名是空的或者重复了,标红的那几格先改掉</span>}
                       <div className="ml-auto flex items-center gap-3">
                         {boardError && <span className="text-[11.5px]" style={{ color: '#c2693f' }}>{boardError}</span>}
@@ -3656,11 +3973,11 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                         </button>
                         <button
                           onClick={saveBoard}
-                          disabled={sending || boardSaving || boardConflict || boardHasKeyErrors}
-                          title={sending ? '生成中,状态板锁定' : boardConflict ? '草稿基于旧板,先看新板或放弃保存' : boardHasKeyErrors ? '有键名是空的或者重复了' : undefined}
+                          disabled={sending || boardSaving || boardRefreshing || boardConflict || boardHasKeyErrors}
+                          title={sending ? '生成中,状态板锁定' : boardRefreshing ? '重算中,等它落地再保存' : boardConflict ? '草稿基于旧板,先看新板或放弃保存' : boardHasKeyErrors ? '有键名是空的或者重复了' : undefined}
                           className="rounded-xl bg-accent hover:brightness-105 text-white text-xs px-4 py-1.5 disabled:opacity-40"
                         >
-                          {boardSaving ? '保存中…' : sending ? '生成中锁定' : boardConflict ? '有冲突,不能保存' : boardHasKeyErrors ? '键名有问题' : '保存'}
+                          {boardSaving ? '保存中…' : sending ? '生成中锁定' : boardRefreshing ? '重算中锁定' : boardConflict ? '有冲突,不能保存' : boardHasKeyErrors ? '键名有问题' : '保存'}
                         </button>
                       </div>
                     </div>
@@ -3696,7 +4013,13 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
 
         {/* 📖 收进章节草稿弹窗已整个拆除,不单独收一段原文进草稿箱——不留死代码。 */}
 
+        {/* 底栏 portal 进壳的底槽(见 studyShell.tsx)。 */}
+        {bottomEl && createPortal((
         <footer ref={footerRef} className="chat-inputbar flex-none z-[2] bg-page/85 backdrop-blur border-t border-line-soft px-6 pt-4 pb-5 max-[760px]:px-3.5">
+          {/* 服务端收尾进度话(status 事件):正文已经流完、done 还没来的那段(状态板自动补算约半分钟)给个交代 */}
+          {sending && streamStatus && (
+            <div className="max-w-2xl mx-auto text-[11.5px] text-ink2 mb-2">{streamStatus}</div>
+          )}
           <div className="max-w-2xl mx-auto flex items-end gap-2.5">
             <button
               onClick={doDryrun}
@@ -3763,7 +4086,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
                 className="w-full resize-none rounded-[20px] border border-line-soft bg-card px-[18px] min-h-12 py-3 text-ink-body leading-relaxed focus:outline-none focus:border-accent overflow-y-auto"
               />
             </div>
-            {sending && turnKind === 'send' ? (
+            {sending && turnKind !== null ? (
               <button onClick={() => abortRef.current?.abort()} className="serc rounded-[18px] bg-ink2 hover:brightness-105 text-white text-sm px-7 h-12 shrink-0 flex items-center justify-center">
                 ■ 暂停
               </button>
@@ -3774,6 +4097,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
             )}
           </div>
         </footer>
+        ), bottomEl)}
 
         {/* 写作屏抽屉覆盖层(布局改造后本体已改成右侧滑栏,见 DeskDrawers.tsx
             头部注释):复用列表屏同一个 DeskDrawerHub 组件本体,两段确认丢弃守卫+焦点陷阱一概原样
@@ -3815,14 +4139,12 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   }
 
   // ══════════════════════════ 渲染:窗口列表屏(page.tsx 同款样式常量) ══════════════════════════
-  // 布局改造:打字桌不再是整页早退接管——现在是 page.tsx 里 stage 内的一个"全高子应用",
-  // 左廊(rail)是它的邻居而不是被它盖住的东西。外壳从"minHeight:100vh 整页流"改成"height:100%
-  // 撑满 stage + 自己内部滚动"(HeatBg 交给 page.tsx 那一份画,这里不重复画,免得两层纱罩叠加变暗);
-  // overflow:hidden 顺手兜住下面文具盒(DeskDrawerHub)侧栏滑入/滑出动画那段还没滑到位的溢出部分,
-  // 不让它在过渡途中戳出这个容器的右边界。
+  // 文档滚动布局(同写作屏):列表随页面自然长高、壳的 scrollEl 滚动,不再自己开滚动条,也不再
+  // 需要 overflow:hidden——文具盒侧栏已改 fixed portal 进壳覆盖槽,滑出动画停在视口外不参与溢出。
+  // HeatBg 交给 page.tsx 那一份画,这里不重复画。
   return (
-    <div style={{ position: 'relative', height: '100%', boxSizing: 'border-box', background: 'var(--page-bg)', fontFamily: 'var(--font-sans)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
-      <div style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto', padding: '34px 28px 72px' }}>
+    <div style={{ position: 'relative', flex: '1 1 auto', boxSizing: 'border-box', background: 'var(--page-bg)', fontFamily: 'var(--font-sans)', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flex: '1 1 auto', padding: '34px 28px 72px' }}>
       <div style={{ maxWidth: 1000, margin: '0 auto' }}>
 
         {/* 下面 DeskDrawerHub 的点外部关闭用 absolute

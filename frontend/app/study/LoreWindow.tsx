@@ -9,18 +9,21 @@
 // 浮窗只做"快改"(调触发词、翻开关、看上一楼命中了谁),精修仍然回书架——同一份数据两个入口,
 // 没有正副本之分(只有一张表,不存在两头写歪的可能)。
 //
-// 布局照抄同屏的时光带/状态板浮窗:absolute 贴在头栏下方,top/maxHeight 由 headerH/footerH 量出来,
-// 自身 overflow-y-auto,实底 + z-[1](压过 HeatBg 那层 z:0 的渐变纱罩,理由见 TypingDesk.tsx 小纸条
-// 抽屉那段注释;不许够到底栏 z-[2]/头栏 z-[8])。
+// 布局照抄同屏的时光带/状态板浮窗:fixed 贴在头栏下方,top/maxHeight 由 topOffset/footerH 量出来,
+// 水平范围由挂载方传的 panelX 对齐写作列,自身 overflow-y-auto,实底 + z-[1](压过 HeatBg 那层 z:0
+// 的渐变纱罩,理由见 TypingDesk.tsx 小纸条抽屉那段注释;不许够到底栏 z-[2]/头栏 z-[8])。
+// 100dvh 假定壳高不受键盘态 visualViewport 驱动;壳若改由 vv 调高,这里要跟着换成壳实际下边界。
 
 import { useEffect, useState } from 'react';
 import { CoreTab, LoreTab } from './DeskDrawers';
 
 export default function LoreWindow({
-  base, envOk, project, headerH, footerH, onDirtyChange, onClose, closeArmed,
+  base, envOk, project, topOffset, footerH, panelX, onDirtyChange, onClose, closeArmed,
 }: {
   base: string; envOk: boolean; project: string;
-  headerH: number; footerH: number;
+  // topOffset=头栏此刻的视口下边缘(窄屏竖廊没滚走时≠头栏高度),挂载方实时量好递进来
+  topOffset: number; footerH: number;
+  panelX: React.CSSProperties;
   // 脏位上报:核心记忆的分块草稿、条目行内编辑器,都是"不点保存就不落库"的中间态。这两个标签页
   // 住在浮窗里,没有抽屉壳的 guardedClose 两段确认保着——不报上去的话,点「关闭」/去开时光带/
   // 去开状态板,填了一半的字就没了。
@@ -46,8 +49,8 @@ export default function LoreWindow({
 
   return (
     <div
-      className="absolute left-0 right-0 z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
-      style={{ top: headerH, maxHeight: `calc(100% - ${headerH}px - ${footerH}px)` }}
+      className="fixed z-[1] border-b border-line-soft bg-card shadow-sm px-6 py-4 max-[760px]:px-3.5 overflow-y-auto"
+      style={{ ...panelX, top: topOffset, maxHeight: `calc(100dvh - ${topOffset}px - ${footerH}px)` }}
     >
       <div className="max-w-2xl mx-auto">
         <div className="flex items-center justify-between gap-2 mb-3">

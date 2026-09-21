@@ -4,7 +4,7 @@
 // 对接 /api/oc/* REST 接口,按约定字段读写;fetch 一律 try/catch,res.ok 和 body.success 都要验,
 // 加载/错误/空态分开显示,不把"没查到"和"查失败"混为一谈。颜色只走 var(--xxx) token,不写死色号。
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from 'react';
 import HeatBg from '../HeatBg';
 import ReadingCorner from './ReadingCorner';
 import TypingDesk, { type TypingDeskHandle } from './TypingDesk';
@@ -12,6 +12,7 @@ import {
   LoreTriggerFields, DEFAULT_LORE_TRIGGER, triggerKeysFromText, triggerModeForSave,
   type LoreTriggerValue, type LorePosition, type CharacterFields,
 } from './LoreTriggerFields';
+import { StudyShellProvider } from './studyShell';
 
 // ── 数据形状(按后端契约来,字段名不许自己发明) ──
 type Stats = { by_category: Record<string, number>; by_project: Record<string, number>; total: number };
@@ -148,8 +149,9 @@ const RAIL_DOORS: { view: View; icon: string; label: string }[] = [
 // 客户端真实宽度,会闪一下或报 mismatch。断点取 700px(>700 才算桌面)。
 // 颜色仍然只走内联 style 里的 var(--xxx),这段 CSS 只管布局方向/宽度/滚动,不带色号。
 const RAIL_CSS = `
-.sty-page { height: 100dvh; overflow: hidden; }
-.sty-shell { display: flex; width: 100%; height: 100dvh; min-height: 0; overflow: hidden; }
+/* 壳只有一个:page.tsx 锁 100dvh+overflow:hidden,视图共用 .sty-stage-scroll 一个内滚区,不许各开滚动区。 */
+.sty-page { height: 100vh; height: 100dvh; overflow: hidden; }
+.sty-shell { display: flex; width: 100%; height: 100vh; height: 100dvh; min-height: 0; overflow: hidden; }
 .sty-rail { width: 176px; flex: none; position: relative; display: flex; flex-direction: column; padding: 18px 12px; border-right: 1px solid var(--line-soft); overflow: hidden; }
 .sty-rail.collapsed { width: 58px; padding-left: 8px; padding-right: 8px; }
 .sty-rail > :not(.sty-rail-pattern) { position: relative; z-index: 1; }
@@ -168,13 +170,20 @@ const RAIL_CSS = `
 .sty-rail-glyph { width: 20px; flex: none; text-align: center; }
 .sty-home { color: var(--ink2); }
 .sty-main { flex: 1 1 auto; min-width: 0; min-height: 0; position: relative; display: flex; flex-direction: column; overflow: hidden; background: var(--card-bg); }
-.sty-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 22px 26px 44px; }
+.sty-stage-top { flex: none; position: relative; z-index: 8; }
+.sty-stage-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior-y: contain; }
+/* ⚠️不加 -webkit-overflow-scrolling:touch:会另起层叠上下文,困住子树里 fixed 的模态 */
+.sty-stage-bottom { flex: none; position: relative; z-index: 2; }
+.sty-stage-scroll.is-page { background: var(--page-bg); } /* 打字桌房间底色由滚动区自己刷,内容不够高也不露白 */
+.sty-overlay { position: absolute; inset: 0; pointer-events: none; }
+.sty-scroll { padding: 22px 26px 44px; }
 @media (min-width: 701px) {
   .sty-shell { flex-direction: row; }
+  .sty-rail { height: 100%; }
 }
 @media (max-width: 700px) {
-  .sty-shell { height: 100dvh; min-height: 0; border: 0 !important; border-radius: 0 !important; flex-direction: column; }
-  .sty-rail { width: 100%; flex-direction: row; align-items: center; gap: 8px; padding: 10px; border-right: 0; border-bottom: 1px solid var(--line-soft); overflow-x: auto; }
+  .sty-shell { border: 0 !important; border-radius: 0 !important; flex-direction: column; }
+  .sty-rail { width: 100%; flex-direction: row; align-items: center; gap: 8px; padding: 10px; border-right: 0; border-bottom: 1px solid var(--line-soft); overflow-x: auto; overscroll-behavior-x: contain; }
   .sty-rail.collapsed { width: 100%; padding: 10px; }
   .sty-rail-brand { display: none; }
   .sty-rail-top, .sty-rail.collapsed .sty-rail-top { flex-direction: row; margin-bottom: 0; }
@@ -185,6 +194,8 @@ const RAIL_CSS = `
   .sty-home { order: -1; margin-top: 0; }
   .sty-scroll { padding: 18px 16px 32px; }
 }
+/* 书房挂载期锁 root/body 滚动,不让 Safari 把 window 推着滚 */
+html.sty-lock-scroll, html.sty-lock-scroll body { overflow: hidden; }
 `;
 
 export default function StudyPage() {
@@ -200,6 +211,44 @@ export default function StudyPage() {
   // 见 TypingDesk.tsx requestLeave 定义处注释)——TypingDesk 挂载时才有实例,ref 初始是 null,
   // 只在 view==='desk' 时才会真的被用到。
   const typingDeskRef = useRef<TypingDeskHandle | null>(null);
+
+  // 壳的槽位(见 studyShell.tsx):槽 DOM 常驻不换节点,value 必须 memo。
+  const [topEl, setTopEl] = useState<HTMLElement | null>(null);
+  const [bottomEl, setBottomEl] = useState<HTMLElement | null>(null);
+  const [scrollEl, setScrollEl] = useState<HTMLElement | null>(null);
+  const [overlayEl, setOverlayEl] = useState<HTMLElement | null>(null);
+  const shellSlots = useMemo(() => ({ topEl, bottomEl, scrollEl, overlayEl }), [topEl, bottomEl, scrollEl, overlayEl]);
+
+  // 挂载期锁 root/body 滚动,卸载还原(CSS 见 .sty-lock-scroll)。
+  useEffect(() => {
+    document.documentElement.classList.add('sty-lock-scroll');
+    return () => { document.documentElement.classList.remove('sty-lock-scroll'); };
+  }, []);
+  // 窗口不滚守则:壳挂着时 window 永远不该滚。键盘不在(可视高度≈壳全高)而 window.scrollY 超过合法上限
+  // = iOS 为聚焦输入框推出的幻影位,当场按回;键盘开着时不碰(那时 iOS 的推动是让输入框露出来用的)。
+  // 全高取壳(.sty-shell,100dvh)当前 clientHeight:iOS 键盘不改 dvh,壳高不随键盘缩;旋转/分屏它跟着变,不会过期。
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const vv = window.visualViewport;
+    const clamp = () => {
+      const fullH = shellRef.current?.clientHeight || window.innerHeight;
+      const vh = vv ? vv.height : window.innerHeight;
+      if (vh < fullH - 60) return; // 键盘在
+      const max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      const sy = window.scrollY;
+      if (sy > max + 1) window.scrollTo(0, max);
+    };
+    window.addEventListener('scroll', clamp, { passive: true });
+    window.addEventListener('resize', clamp);
+    vv?.addEventListener('scroll', clamp);
+    vv?.addEventListener('resize', clamp);
+    return () => {
+      window.removeEventListener('scroll', clamp);
+      window.removeEventListener('resize', clamp);
+      vv?.removeEventListener('scroll', clamp);
+      vv?.removeEventListener('resize', clamp);
+    };
+  }, []);
 
   useEffect(() => {
     try { setRailCollapsed(localStorage.getItem('study_rail_collapsed') === '1'); } catch { /* storage 不可用就保持展开 */ }
@@ -508,6 +557,11 @@ export default function StudyPage() {
     restoreSeqRef.current++;
     setView(v);
   }
+  // 切门回顶(绘制前同步,先跳滚动再换内容会闪两拍);window 一并归零,收拾 Safari 键盘态留下的偏移。
+  useLayoutEffect(() => {
+    scrollEl?.scrollTo(0, 0);
+    window.scrollTo(0, 0);
+  }, [view, scrollEl]);
   function openProject(project: string) {
     setCurrentProject(project);
     setCurrentCategory('all');
@@ -664,6 +718,7 @@ export default function StudyPage() {
     <div className="sty-page" style={{ position: 'relative', boxSizing: 'border-box', background: 'var(--page-bg)', fontFamily: 'var(--font-sans)' }}>
       <style>{RAIL_CSS}</style>
       <div
+        ref={shellRef}
         className="sty-shell"
         style={{
           position: 'relative', zIndex: 1, background: 'var(--card-bg)',
@@ -703,6 +758,9 @@ export default function StudyPage() {
         </nav>
 
         <div className="sty-main">
+        <StudyShellProvider value={shellSlots}>
+        <div className="sty-stage-top" ref={setTopEl} />
+        <div className={`sty-stage-scroll${view === 'desk' ? ' is-page' : ''}`} ref={setScrollEl}>
         {view === 'desk' ? (
           <TypingDesk ref={typingDeskRef} base={base} envOk={envOk} onBack={() => navigate('shelf')} />
         ) : (
@@ -1027,6 +1085,10 @@ export default function StudyPage() {
 
         </div>
         )}
+        </div>
+        <div className="sty-stage-bottom" ref={setBottomEl} />
+        <div className="sty-overlay" ref={setOverlayEl} />
+        </StudyShellProvider>
         </div>
       </div>
     </div>

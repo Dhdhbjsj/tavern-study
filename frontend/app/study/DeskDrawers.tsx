@@ -13,11 +13,13 @@
 // 设定/大纲的那一行,正文与触发配置同住一行。旧的 desk_lore 指针表已经 DROP 掉。
 
 import { useState, useEffect, useRef, useCallback, forwardRef, useImperativeHandle } from 'react';
+import { createPortal } from 'react-dom';
 import {
   LoreTriggerFields, triggerKeysFromText, triggerModeForSave,
   inputStyle, btnGhostStyle, fieldLabelStyle,
   type CharacterFields, type LoreTriggerValue,
 } from './LoreTriggerFields';
+import { useStudyShell } from './studyShell';
 
 // ── 数据形状(照后端 tools/deskPanels.ts / tools/desk.ts / tools/deskRecipes.ts / tools/study.ts 的真实返回来)──
 type Weight = 'light' | 'heavy';
@@ -126,7 +128,18 @@ function useDoubleConfirm(action: (id: string) => void) {
 // N选1真单选钮(同组物理互斥)判断留观:S1导入解析器没抽 ST 的"分组互斥"字段(工单§4 S2范围早钉过
 // 这条——desk_blocks 落库时就没存这个位),这里没有组信息可供 UI 做真单选。S5a 按工单原文"SKIP for
 // S5a,ST has no group data"跳过,只做普通 toggle;真互斥要等 S1 解析器补上分组字段才谈得上。
-function BlocksTab({ base, envOk, project, onDirtyChange, onRegexChanged, onOverlayOpenChange }: { base: string; envOk: boolean; project: string; onDirtyChange?: (dirty: boolean) => void; onRegexChanged?: () => void; onOverlayOpenChange?: (open: boolean) => void }) {
+// 默认选配方三级兜底:每次点开文具盒都落在最后导入的那套预设,不是常用的那套,体验很差——
+// 记这个project上次手动选过/切过的配方id,当窗口没带着自己的recipe_id、或那份配方已经不在列表里
+// 时垫底用。读写都try/catch:localStorage在隐私模式/存储禁用时会抛,静默降级不影响主流程。
+function lastRecipeStorageKey(project: string) { return `oc_desk_drawer_recipe:${project}`; }
+function readLastRecipeId(project: string): string {
+  try { return localStorage.getItem(lastRecipeStorageKey(project)) || ''; } catch { return ''; }
+}
+function writeLastRecipeId(project: string, id: string) {
+  try { localStorage.setItem(lastRecipeStorageKey(project), id); } catch { /* 存储不可用,静默降级 */ }
+}
+
+function BlocksTab({ base, envOk, project, currentRecipeId, onDirtyChange, onRegexChanged, onOverlayOpenChange }: { base: string; envOk: boolean; project: string; currentRecipeId?: string; onDirtyChange?: (dirty: boolean) => void; onRegexChanged?: () => void; onOverlayOpenChange?: (open: boolean) => void }) {
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -181,6 +194,10 @@ function BlocksTab({ base, envOk, project, onDirtyChange, onRegexChanged, onOver
   // 拿它在响应回来时读"当下选中的配方",在 setState 外面纯算决策(updater 内赋值不纯,不安全)
   const recipeIdRef = useRef('');
   useEffect(() => { recipeIdRef.current = recipeId; }, [recipeId]);
+  // currentRecipeId 的 ref 镜像:同上,给下面 recipes 刷新 effect 读"这个窗口正用着哪份配方"
+  // (三级默认第一级),不进它的 deps。
+  const currentRecipeIdRef = useRef(currentRecipeId);
+  useEffect(() => { currentRecipeIdRef.current = currentRecipeId; }, [currentRecipeId]);
   useEffect(() => {
     dirtyRef.current = dirty;
     // 所有权只在"草稿出生"时登记一次、"草稿死亡"时注销——绝不随 recipeId 变化改嫁(确认切换后
@@ -254,7 +271,19 @@ function BlocksTab({ base, envOk, project, onDirtyChange, onRegexChanged, onOver
         const stillThere = !!prevId && list.some((r) => r.id === prevId);
         const holdVanished = !stillThere && !!prevId && dirtyRef.current && draftRecipeIdRef.current === prevId;
         setRecipes(list);
-        if (!stillThere && !holdVanished) setRecipeId(list[0]?.id || '');
+        // 三级默认:窗口自己带着的当前配方(currentRecipeId)最贴近此刻真正在编的窗;没有窗口
+        // 上下文(列表屏抽屉)或那份配方已经不在列表里,退 localStorage 记的这个 project 上次
+        // 手动选过的;再没有才落列表第一个——只在这条"干净态需要重置"的分支生效,holdVanished
+        // 那半扣留脏草稿的逻辑一字不动。
+        if (!stillThere && !holdVanished) {
+          const curId = currentRecipeIdRef.current;
+          const lastId = readLastRecipeId(project);
+          const fallback =
+            (curId && list.some((r) => r.id === curId)) ? curId :
+            (lastId && list.some((r) => r.id === lastId)) ? lastId :
+            (list[0]?.id || '');
+          setRecipeId(fallback);
+        }
         if (holdVanished) setSaveError('这个配方在服务端已经不存在了——草稿还留在屏上,先把改动复制走或新建配方另存');
         if (list.length === 0 && !holdVanished) setCreating(true);
       } catch (e: any) {
@@ -628,6 +657,8 @@ function BlocksTab({ base, envOk, project, onDirtyChange, onRegexChanged, onOver
     setDirty(false);
     setBlockDrafts({});
     setRecipeId(target);
+    // 记下这个 project 这次真正切到的配方——下次干净态打开文具盒时的三级默认第二级垫底用。
+    writeLastRecipeId(project, target);
   }
 
   async function saveRecipe() {
@@ -2253,6 +2284,7 @@ const DeskDrawerHub = forwardRef<DeskDrawerHandle, {
   base: string; envOk: boolean; project: string; open: boolean; onClose: () => void; onRegexChanged?: () => void;
   windowSettings?: WindowSettings;
 }>(function DeskDrawerHub({ base, envOk, project, open, onClose, onRegexChanged, windowSettings }, drawerHandleRef) {
+  const { overlayEl } = useStudyShell(); // 背板/侧栏的 portal 目标(见 studyShell.tsx)
   const [tab, setTab] = useState<TabKey>('blocks');
   // 世界书/核心记忆两个标签页已抬进浮窗(LoreWindow.tsx),它们的脏位跟着走——这里只剩积木/配方
   // 一路真草稿(正则是点开关就地生效、导入是选文件即触发,本来就没有"不点保存就不落库"的中间态)。
@@ -2445,10 +2477,10 @@ const DeskDrawerHub = forwardRef<DeskDrawerHandle, {
   }
 
   // 侧栏化(照原型 .penbox):从"居中弹层+全屏背板压黑"改成"从右侧滑入的侧栏"——只覆盖
-  // 打字桌/列表屏内容区右侧,不遮左廊、不整页压黑。定位靠 absolute 贴着调用方那个 position:relative
-  // 外壳(TypingDesk 写作屏/列表屏各自的根容器),不用 fixed inset-0 到全视口——这样宽度天然被外壳
-  // (=stage 内容区)卡住,不会盖住廊子。点侧栏外的内容区=尝试关闭,走跟"关闭"按钮同一套 guardedClose
-  // (有未存草稿两段确认,不绕过守卫)。
+  // 打字桌/列表屏内容区右侧,不遮左廊、不整页压黑。背板与本体都 portal 进壳级覆盖槽
+  // (studyShell.tsx overlayEl),absolute 贴槽矩形——宽度天然被 stage 内容区卡住,不会盖住廊子。
+  // 槽 pointer-events:none,两块各自显式开 auto。点侧栏外的内容区=尝试关闭,走跟"关闭"按钮
+  // 同一套 guardedClose(有未存草稿两段确认,不绕过守卫)。
   //
   // 层级顺序:背板 z:7 < 头栏 z:8 < 侧栏本体 z:9——上一轮为了让列表屏"← 书架"
   // 钮点得到,把整条头栏提到了 z:10,反而压过了侧栏本体(彼时 z:8),侧栏顶部的"关闭"钮/本窗设置区
@@ -2456,7 +2488,8 @@ const DeskDrawerHub = forwardRef<DeskDrawerHandle, {
   // 比背板高,背板继续负责"点外部关闭"),两个调用方(TypingDesk 写作屏/列表屏)的头栏统一降到 8——
   // 头栏依然高过背板(点得到"← 返回"/"← 书架"/rail 那几个门,不会被背板截胡),但低于侧栏本体
   // (侧栏打开时头栏不再盖住侧栏顶端,关闭钮/本窗设置区/tab 全程可点)。
-  return (
+  if (!overlayEl) return null; // 覆盖槽首帧未就绪不渲
+  return createPortal(
     <>
       <div
         className="absolute inset-0"
@@ -2478,6 +2511,7 @@ const DeskDrawerHub = forwardRef<DeskDrawerHandle, {
           boxShadow: '-12px 0 34px var(--card-shadow2)',
           zIndex: 9,
           outline: 'none',
+          pointerEvents: 'auto', // 覆盖槽的 none 会继承
           transform: slideIn ? 'translateX(0)' : 'translateX(105%)',
           transition: reducedMotion ? 'none' : 'transform .28s ease',
         }}
@@ -2550,12 +2584,13 @@ const DeskDrawerHub = forwardRef<DeskDrawerHandle, {
           {/* project 维度全部标签页用 key={project} 挂——切项目=整份子树重挂载,旧项目的搜索
               结果/选中态/请求回调统统随卸载作废,不会有"A项目搜到的书流进B项目的世界书指针"这类
               串项目事故;F2 的请求令牌是同一挂载周期内的第二道保险,两条一起才算"带式而不只是保险"。*/}
-          {tab === 'blocks' && <BlocksTab key={project} base={base} envOk={envOk} project={project} onDirtyChange={setBlocksDirty} onRegexChanged={onRegexChanged} onOverlayOpenChange={setBlocksOverlayOpen} />}
+          {tab === 'blocks' && <BlocksTab key={project} base={base} envOk={envOk} project={project} currentRecipeId={windowSettings?.recipeId} onDirtyChange={setBlocksDirty} onRegexChanged={onRegexChanged} onOverlayOpenChange={setBlocksOverlayOpen} />}
           {tab === 'regex' && <RegexTab base={base} envOk={envOk} onRegexChanged={onRegexChanged} />}
           {tab === 'import' && <ImportTab base={base} envOk={envOk} project={project} onRegexChanged={onRegexChanged} />}
         </div>
       </div>
-    </>
+    </>,
+    overlayEl
   );
 });
 
