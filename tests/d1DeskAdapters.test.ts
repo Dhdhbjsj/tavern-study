@@ -64,6 +64,18 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     assert.equal((await assets.listQueueBlocks('p')).length, 1);
     assert.deepEqual((await assets.listUpRegexForPreset('p')).map((row) => row.id), ['rx']);
 
+    // Same-sortOrder tie-break must match SQLite's BINARY (UTF-8 byte) order: a supplementary-plane
+    // id (U+10000) sorts AFTER a private-use-area id (U+E000) here — verifies the memory adapter's
+    // ordinalCompare (see tests/deskAssetStorage.test.ts) actually agrees with real D1 on this pair,
+    // not just internally with itself. Plain UTF-16 code-unit comparison would get this backwards
+    // (U+10000's leading surrogate 0xD800 < 0xE000).
+    const pua = '\u{E000}'; const supplementary = '\u{10000}';
+    await db.batch([
+      db.prepare(`INSERT INTO desk_regex (id, scope, preset_id, find, replace, flags, direction, enabled, meta, sort_order) VALUES (?, 'preset', 'p', 'x', 'y', '', 'up', 1, '{}', 0)`).bind(supplementary),
+      db.prepare(`INSERT INTO desk_regex (id, scope, preset_id, find, replace, flags, direction, enabled, meta, sort_order) VALUES (?, 'preset', 'p', 'x', 'y', '', 'up', 1, '{}', 0)`).bind(pua),
+    ]);
+    assert.deepEqual((await assets.listUpRegexForPreset('p')).map((row) => row.id), ['rx', pua, supplementary]);
+
     // autoRefreshBoard: the two UPDATEs run inside one db.batch (single implicit D1 transaction) —
     // a matching call writes both window.state_board and the floor's report tag together; a call
     // whose floor-identity input no longer matches must leave BOTH untouched, even when the
@@ -93,6 +105,36 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     assert.equal(missedRefresh.ok, false);
     assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // not bumped to step 3
     assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // report untouched from the earlier successful refresh
+
+    // Reverse half-state (codex round 2, #1): a D1 batch only rolls back on a thrown error, not on
+    // a statement matching 0 rows — so the floor UPDATE (which only checks content/commitToken) can
+    // independently succeed even when the window UPDATE's own CAS misses, unless the floor UPDATE
+    // is also gated on the window having already landed the new values. Verified both ways the
+    // window guard can fail while the floor's own identity (content/commitToken) still matches:
+    const staleUpdatedAt = await turns.autoRefreshBoard({
+      windowId: 'w3', floorId: 'rf',
+      expectedWindowStateBoard: { step: 2 }, expectedWindowUpdatedAt: 'wrong-updated-at', // ① window's own updated_at is stale
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'stale text', expectedFloorCommitToken: refreshToken,
+      nextBoard: { step: 4 }, nextFloorReport: { stateBoardAutoRefreshed: true, decoy: 'must not land' },
+      refreshedAt: 't8',
+    });
+    assert.equal(staleUpdatedAt.ok, false);
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // not bumped to step 4
+    assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // report not overwritten with the decoy
+
+    await desk.createFloor({ id: 'rf2', windowId: 'w3', role: 'user', content: 'a newer floor landed', variants: ['a newer floor landed'], activeVariant: 0, thinking: null, report: null, createdAt: 't6x' });
+    const newerFloorLanded = await turns.autoRefreshBoard({
+      windowId: 'w3', floorId: 'rf',
+      // window's own board bytes/updated_at still match on their own — only the "still the
+      // window's latest floor" NOT EXISTS clause fails, because rf2 landed after rf.
+      expectedWindowStateBoard: { step: 2 }, expectedWindowUpdatedAt: 't6', // ② a newer floor has landed
+      expectedFloorCreatedAt: t2, expectedFloorContent: 'stale text', expectedFloorCommitToken: refreshToken,
+      nextBoard: { step: 5 }, nextFloorReport: { stateBoardAutoRefreshed: true, decoy: 'must not land' },
+      refreshedAt: 't9',
+    });
+    assert.equal(newerFloorLanded.ok, false);
+    assert.deepEqual((await desk.getWindow('w3'))?.stateBoard, { step: 2 }); // not bumped to step 5
+    assert.deepEqual((await desk.getFloor('rf'))?.report?.boardAfter, { step: 2 }); // report not overwritten with the decoy
 
     const reading = new D1ReadingStorage(db);
     await reading.createChapter({ id: 'ch', project: 'P', chapterNo: '1', title: 'One', content: 'Body', summary: '', status: 'draft', createdAt: 't0', updatedAt: 't0', publishedAt: null });

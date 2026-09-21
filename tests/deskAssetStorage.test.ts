@@ -41,7 +41,7 @@ test('empty regex list falls back to preset+global, only up/both/enabled rules, 
   assert.deepEqual(ids, ['p0', 'p1', 'g1']);
 });
 
-test('same sortOrder ties break by UTF-16 code unit order, not locale collation — mixed case and non-ASCII ids stay in D1 binary order', async () => {
+test('same sortOrder ties break by code point order, not locale collation — mixed case and non-ASCII ids stay in D1 binary order', async () => {
   const storage = createMemoryStorage({
     deskPresetIds: ['p'],
     deskRegex: [
@@ -52,10 +52,29 @@ test('same sortOrder ties break by UTF-16 code unit order, not locale collation 
     ],
   });
   const ids = (await storage.deskAssets.listUpRegexForPreset('p')).map((row) => row.id);
-  // Code-unit order: 'B'(66) < 'a'(97) < 'z'(122) < 'é'(233) — this diverges from default-locale
+  // Code point order: 'B'(66) < 'a'(97) < 'z'(122) < 'é'(233) — this diverges from default-locale
   // collation (which sorts 'a' before 'B' and folds 'é' next to 'e'), matching SQLite's BINARY
-  // default collating sequence that D1's ORDER BY id relies on.
+  // default collating sequence that D1's ORDER BY id relies on. Code point order equals UTF-8 byte
+  // order for every valid Unicode scalar sequence (see the next test for the case where UTF-16
+  // code-unit order — plain JS `<`/`>` — would get this wrong instead).
   assert.deepEqual(ids, ['B', 'a', 'z', 'é']);
+});
+
+test('same sortOrder ties: a supplementary-plane id (U+10000) sorts after a private-use-area id (U+E000), matching UTF-8 byte order — not UTF-16 code unit order, which would reverse them', async () => {
+  const pua = '\u{E000}'; // BMP private-use character: UTF-16 code unit 0xE000, UTF-8 bytes EE 80 80
+  const supplementary = '\u{10000}'; // supplementary-plane character: UTF-16 surrogate pair starting 0xD800, UTF-8 bytes F0 90 80 80
+  // Under plain UTF-16 code-unit comparison (JS `<`), the supplementary character's leading
+  // surrogate (0xD800) is numerically less than 0xE000, so it would sort BEFORE the PUA character —
+  // backwards from both code point order (65536 > 57344) and UTF-8 byte order (F0 > EE).
+  const storage = createMemoryStorage({
+    deskPresetIds: ['p'],
+    deskRegex: [
+      { id: supplementary, find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+      { id: pua, find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'p', sortOrder: 0 },
+    ],
+  });
+  const ids = (await storage.deskAssets.listUpRegexForPreset('p')).map((row) => row.id);
+  assert.deepEqual(ids, [pua, supplementary]);
 });
 
 test('importPack stamps scope=preset and presetId on its regex rules — a pack default list never leaks another pack\'s rules', async () => {

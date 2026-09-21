@@ -16,11 +16,21 @@ export interface MemorySeed {
   deskState?: Record<string, string>;
 }
 
-// SQLite 默认 BINARY 排序规则按字节序比较,不认 locale;localeCompare 受运行环境 locale 影响
-// (比如 'B' 排在 'a' 前后不一定),用它替代 id 并列决胜会跟 D1 的 ORDER BY id 对不上。这里按
-// UTF-16 code unit 逐位比较(JS 原生 </> 就是这个语义),不经过 Intl 排序规则。
+// SQLite 默认 BINARY 排序规则按 UTF-8 字节序比较,不认 locale;localeCompare 受运行环境 locale
+// 影响(比如 'B' 排在 'a' 前后不一定),用它替代 id 并列决胜会跟 D1 的 ORDER BY id 对不上。
+// ⚠️不能直接用 JS 原生 </>(那是 UTF-16 code unit 逐位比较):补充平面字符(如 U+10000)在 UTF-16
+// 里编码成高低代理对,首个 code unit 落在 0xD800-0xDBFF 区间,会被误判成排在 U+E000(私用区)
+// 之前——但按真实码位值 U+10000 > U+E000,UTF-8 字节序也是后者更大,两者在这一类字符上正好相反。
+// 按码位(code point)逐位比较不会踩这个坑:UTF-8 字节序与码位序对任意合法字符序列都是同一个
+// 顺序(UTF-8 编码设计保证的不变式),不需要真的现算 UTF-8 字节。
 function ordinalCompare(a: string, b: string): number {
-  return a < b ? -1 : a > b ? 1 : 0;
+  const ac = Array.from(a, (ch) => ch.codePointAt(0) ?? 0);
+  const bc = Array.from(b, (ch) => ch.codePointAt(0) ?? 0);
+  const len = Math.min(ac.length, bc.length);
+  for (let i = 0; i < len; i++) {
+    if (ac[i] !== bc[i]) return ac[i] < bc[i] ? -1 : 1;
+  }
+  return ac.length - bc.length;
 }
 
 export class MemoryDeskStoryStorage implements DeskStoryStorage {

@@ -43,10 +43,14 @@ export class D1DeskTurnStorage implements DeskTurnStorage {
   }
 
   // 四证 CAS:板字节+窗口updated_at 未变、本楼仍是该窗最新一楼(NOT EXISTS 更晚的楼层)、楼层
-  // content/commitToken 未变,全部成立才写。两条 UPDATE 必须放同一个 db.batch——D1 的 batch 是单个
-  // 隐式事务(同一连接内顺序执行,提交或整体回滚,不会被别的写入方插在两条中间),两条各自的 changes
-  // 因此天然同进同退,不会出现"窗口那条改了、楼层那条因为中途被并发编辑改动而落空"的半截态
-  // (之前拆成两次独立 .run() 请求时,两次网络往返之间是有空档给并发写入插进来的)。
+  // content/commitToken 未变,全部成立才写。两条 UPDATE 放同一个 db.batch(D1 的 batch 是单个隐式
+  // 事务,同一连接内顺序执行,报错才整体回滚;命中 0 行不算错,不会自动联动另一条)。
+  // ⚠️batch 不自动联动:第一条(窗口)WHERE 命中 0 行时,第二条(楼层)若只看 content/commitToken,
+  // 这两个值跟窗口那条是否写成功无关——窗口那条落空、楼层这条照样能命中,楼层被打上
+  // stateBoardAutoRefreshed 但 boardAfter 指向一块从未真正写进窗口的板(反向半截态)。
+  // 修法:楼层这条也加一个 EXISTS,绑窗口那条**写入后的新值**(nextBoard JSON、refreshedAt)——
+  // 同一事务里第二条能看见第一条已经写下的结果,第一条没写成,窗口的 state_board/updated_at
+  // 就还是旧值、绝不会等于这里绑的新值,这条 EXISTS 必然判假,两条真正同进同退。
   async autoRefreshBoard(input: DeskAutoRefreshBoardInput): Promise<DeskAutoRefreshBoardResult> {
     const results = await this.db.batch([
       this.db.prepare(
@@ -60,11 +64,13 @@ export class D1DeskTurnStorage implements DeskTurnStorage {
         input.windowId, input.expectedFloorCreatedAt, input.expectedFloorCreatedAt, input.floorId,
         input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
       ),
-      // 与第一条共享同一份 content/commitToken 前置(同一事务内这两个值中途不会被第三方改动),
-      // 第一条的 EXISTS 子句判过真,这条的 WHERE 用相同谓词重复判定必然同真,不会各判各的。
       this.db.prepare(
-        `UPDATE desk_floors SET report = ? WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?`
-      ).bind(JSON.stringify(input.nextFloorReport), input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken),
+        `UPDATE desk_floors SET report = ? WHERE id = ? AND content = ? AND json_extract(report, '$.commitToken') = ?
+          AND EXISTS (SELECT 1 FROM desk_windows WHERE id = ? AND state_board = ? AND updated_at = ?)`
+      ).bind(
+        JSON.stringify(input.nextFloorReport), input.floorId, input.expectedFloorContent, input.expectedFloorCommitToken,
+        input.windowId, JSON.stringify(input.nextBoard), input.refreshedAt,
+      ),
     ]);
     const winChanges = results[0]?.meta?.changes ?? 0;
     const repChanges = results[1]?.meta?.changes ?? 0;
