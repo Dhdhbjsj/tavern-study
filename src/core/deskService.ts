@@ -23,7 +23,7 @@ export class DeskService {
   async createWindow(input: { project?: string; title?: string; recipeId?: string }) {
     if (!input?.project?.trim() || !input?.title?.trim() || !input?.recipeId?.trim()) return { success: false, error: 'project, title, and recipeId are required.' };
     const now = new Date().toISOString();
-    const window: DeskWindow = { id: `win_${crypto.randomUUID()}`, project: input.project.trim(), title: input.title.trim(), recipeId: input.recipeId.trim(), note: '', noteDepth: 3, stateBoard: {}, timelineState: {}, vars: {}, createdAt: now, updatedAt: now };
+    const window: DeskWindow = { id: `win_${crypto.randomUUID()}`, project: input.project.trim(), title: input.title.trim(), recipeId: input.recipeId.trim(), note: '', noteDepth: 1, stateBoard: {}, timelineState: {}, vars: {}, createdAt: now, updatedAt: now };
     await this.storage.createWindow(window);
     return { success: true, window };
   }

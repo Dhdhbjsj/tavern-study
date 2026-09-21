@@ -196,7 +196,7 @@ ST 正则脚本子集：`find`/`replace`/`flags`/`direction`。见 `src/tools/de
 | `title` | 标题 |
 | `recipe_id` | 使用的配方 |
 | `note` | 作者笔记（导演note） |
-| `note_depth` | 笔记插入深度 |
+| `note_depth` | 作者笔记贴的位置，只认两档：`1`=贴在本楼输入之前，`0`=贴在之后（不再插进旧楼层之间）；其它数值一律按 `1` 处理。旧库里留存的非 0/1 值会被迁移自动归一成 `1`，想要「之后」需手动改成 `0` |
 | `state_board` | JSON，当前状态板（在场角色/开放线索等结构化字段） |
 | `timeline_state` | JSON，`{ segs: [...], cutoff, rev }`——时光带摘要段数组（硬顶 20 段）、折叠截止点、版本号 |
 | `vars` | JSON，宏变量池（`{{setvar}}`/`{{getvar}}`/`{{addvar}}`，`setglobalvar`/`getglobalvar`/`addglobalvar` 是同一个池的别名） |

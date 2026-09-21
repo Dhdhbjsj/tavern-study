@@ -1066,7 +1066,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
       if (mySeq !== loadSeqRef.current) return; // 同一扇窗内被更新的一轮(send/reroll重新起跑)顶掉了,旧对账整体放弃提交
       const w: WindowDetail = {
         id: d.window.id, project: d.window.project, title: d.window.title || '', recipe_id: d.window.recipe_id,
-        note: d.window.note || '', note_depth: typeof d.window.note_depth === 'number' ? d.window.note_depth : 3,
+        note: d.window.note || '', note_depth: d.window.note_depth === 0 ? 0 : 1,
         state_board: d.window.state_board && typeof d.window.state_board === 'object' ? d.window.state_board : {},
         timeline_state: d.window.timeline_state && typeof d.window.timeline_state === 'object'
           ? d.window.timeline_state : { segs: [], cutoff: null, rev: 0 },
@@ -2359,7 +2359,8 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
   // ── 📝 导演小纸条抽屉 ──
   const [noteOpen, setNoteOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState('');
-  const [noteDepthDraft, setNoteDepthDraft] = useState(3);
+  // 小纸条位置两档(ST 深度语义):1=本楼输入之前,0=本楼输入之后
+  const [noteDepthDraft, setNoteDepthDraft] = useState<0 | 1>(1);
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteError, setNoteError] = useState('');
   const noteSavingRef = useRef(false);
@@ -2373,7 +2374,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (!loreGate('note')) return;
     if (timelineOpen || boardOpen) resetBoardState();
     resetLoreState();
-    if (!noteOpen && win) { setNoteDraft(win.note || ''); setNoteDepthDraft(win.note_depth ?? 3); setNoteError(''); }
+    if (!noteOpen && win) { setNoteDraft(win.note || ''); setNoteDepthDraft(win.note_depth === 0 ? 0 : 1); setNoteError(''); }
     setNoteOpen((o) => !o);
   }
   async function saveNote() {
@@ -2384,7 +2385,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     // 刻意不查 sendingRef(验收修正):生成收尾的窗口写回只动 state_board,不碰 note/note_depth,
     // 生成期间改小纸条无冲突且是合理操作(调下一轮的导演指示)——别学状态板那把锁,那把锁的
     // 理由(模型这楼末尾要写板)对小纸条不成立。重入锁+下方世界代数双证已够。
-    const depth = Math.max(1, Math.min(10, Math.round(noteDepthDraft) || 3));
+    const depth: 0 | 1 = noteDepthDraft === 0 ? 0 : 1;
     // 世界代数双证(同 saveBoard 那道跨窗回写闸):PUT打的是发起这一刻的窗,落地前核对
     // 还在这扇窗、世界没翻篇,不一致就静默丢弃这份回写,不弹错(数据已经落进当初那扇窗了)。
     const savedWindowId = curWindowId;
@@ -2677,7 +2678,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (!loreGate('board')) return false;
     if (timelineOpen && !boardGate('board')) return false;
     if (noteOpen) {
-      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth ?? 3);
+      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth === 0 ? 0 : 1);
       if (noteDirty) { setNoteError('先保存或取消小纸条，再打开状态板'); return false; }
     }
     resetLoreState();
@@ -2701,7 +2702,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (loreOpen) { requestLoreClose(); return; }
     if ((boardOpen || timelineOpen) && !boardGate('lore')) return;
     if (noteOpen) {
-      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth ?? 3);
+      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth === 0 ? 0 : 1);
       if (noteDirty) { setNoteError('先保存或取消小纸条，再打开世界书'); return; }
     }
     if (boardOpen || timelineOpen) resetBoardState();
@@ -2715,7 +2716,7 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
     if (!loreGate('timeline')) return;
     if (boardOpen && !boardGate('timeline')) return;
     if (noteOpen) {
-      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth ?? 3);
+      const noteDirty = noteDraft !== (win?.note || '') || noteDepthDraft !== (win?.note_depth === 0 ? 0 : 1);
       if (noteDirty) { setNoteError('先保存或取消小纸条，再打开时光带'); return; }
     }
     resetLoreState();
@@ -3768,20 +3769,21 @@ const TypingDesk = forwardRef<TypingDeskHandle, { base: string; envOk: boolean; 
               <textarea
                 value={noteDraft}
                 onChange={(e) => setNoteDraft(e.target.value)}
-                placeholder="（这段悄悄话会按深度插进近景楼层间,照 ST 作者注释的语义)"
+                placeholder="（给本楼的临时指令,贴在本楼输入旁边;位置照 ST 作者注释深度 1/0 的语义)"
                 rows={3}
                 className="w-full resize-none rounded-2xl border border-dashed border-dash-line bg-page px-4 py-3 text-sm text-ink-body leading-relaxed focus:outline-none"
               />
               <div className="flex items-center gap-3 mt-2.5 flex-wrap">
-                <label className="flex items-center gap-2 text-xs text-ink2">
-                  深度
-                  <input
-                    type="number" min={1} max={10} value={noteDepthDraft}
-                    onChange={(e) => setNoteDepthDraft(Number(e.target.value))}
-                    className="w-14 text-center rounded-lg border border-line-soft bg-card px-2 py-1 text-xs text-ink-body focus:outline-none"
-                  />
-                </label>
-                <span className="text-[11px] text-ink2">从近景末尾往前数第几层插入(1-10)</span>
+                <span className="text-xs text-ink2">位置</span>
+                <div className="flex items-center rounded-lg border border-line-soft overflow-hidden text-xs">
+                  {([[1, '输入之前'], [0, '输入之后']] as Array<[0 | 1, string]>).map(([v, label]) => (
+                    <button
+                      key={v} type="button" onClick={() => setNoteDepthDraft(v)}
+                      className={`px-3 py-1 ${noteDepthDraft === v ? 'bg-accent text-white' : 'bg-card text-ink-body hover:brightness-95'}`}
+                    >{label}</button>
+                  ))}
+                </div>
+                <span className="text-[11px] text-ink2">紧挨本楼输入,不再插进旧楼层</span>
                 <div className="ml-auto flex items-center gap-3">
                   {noteError && <span className="text-[11.5px]" style={{ color: '#c2693f' }}>{noteError}</span>}
                   <button onClick={() => setNoteOpen(false)} disabled={noteSaving} className="text-xs text-ink2 hover:text-ink-body">取消</button>

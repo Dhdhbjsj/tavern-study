@@ -65,7 +65,7 @@ interface ModelBackend {
 三步接线：
 
 1. **改名占位符。** 复制 `wrangler.toml`，把 `database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"` 换成你自己的 D1 database id；如果要开语义检索，把 `index_name = "REPLACE_WITH_YOUR_VECTORIZE_INDEX"` 也换掉，否则删掉 `[[vectorize]]`/`[ai]` 两段（`StudyService`/`assembleDesk` 会在缺绑定时自动降级，不需要代码改动）。
-2. **建库。** 全新数据库用 `npm run db:init:local`（跑 `examples/cloudflare/schema/init.sql`）；已有数据库用 `npm run db:migrate:local`（跑 `examples/cloudflare/schema/migrations/` 下按序号排列的迁移文件）。这两个 script 都带 `--local`，只落在 wrangler 本地模拟环境；部署到真实 D1 时把 `wrangler d1 execute .../wrangler d1 migrations apply ...` 命令里的 `--local` 换成 `--remote` 自己跑一遍（生产库跑迁移前先备份）。
+2. **建库。** 全新数据库用 `npm run db:init:local`（跑 `examples/cloudflare/schema/init.sql`）；已有数据库用 `npm run db:migrate:local`（跑 `examples/cloudflare/schema/migrations/` 下按序号排列的迁移文件）。这两个 script 都带 `--local`，只落在 wrangler 本地模拟环境；部署到真实 D1 时把 `wrangler d1 execute .../wrangler d1 migrations apply ...` 命令里的 `--local` 换成 `--remote` 自己跑一遍（生产库跑迁移前先备份）。用 init.sql 建的库没有迁移账本，以后升级直接跑 `db:migrate:local`/`migrations apply` 即可——`0001_initial.sql` 全程 `IF NOT EXISTS`，对已经建过的表/索引/触发器幂等跳过,不会报"表已存在",后面的迁移文件照常接上。
 3. **配 secrets。** `ANTHROPIC_API_KEY`、`AUTH_TOKEN`、`OWNER_TOKEN`（可选 `OWNER_TOKEN_PREVIOUS`/`COMPANION_TOKEN`/`COMPANION_TOKEN_PREVIOUS`）都用 `wrangler secret put <NAME>` 设置，不要写进源码或 `wrangler.toml`。`AUTH_TOKEN` 单独网关 `/{AUTH_TOKEN}/api/oc/*` 写手管理面；`OWNER_TOKEN`/`COMPANION_TOKEN` 是 Bearer token，网关 MCP 和发布/评论路由（细节见 README「MCP 面」一节）。
 
 `npm run build` 是 `wrangler deploy --dry-run --outdir dist`（干跑，不实际发布），`npm run release:check` 在此基础上再跑 typecheck/test/hygiene 扫描。真正发布用你自己的 `wrangler deploy`。

@@ -93,7 +93,7 @@ export async function deskWindowCreate(env: DeskWindowsEnv, body: any): Promise<
     // deskTimeline.ts 的 CAS 要求 blob 里一定能 json_extract 出 $.rev,见该文件头注释判断留观。
     const meta = await env.OC_DB.prepare(
       `INSERT INTO desk_windows (id, project, title, recipe_id, note, note_depth, state_board, timeline_state, vars, created_at, updated_at)
-       SELECT ?, ?, ?, ?, '', 3, '{}', ?, '{}', ?, ? WHERE EXISTS (SELECT 1 FROM desk_recipes WHERE id = ?)`
+       SELECT ?, ?, ?, ?, '', 1, '{}', ?, '{}', ?, ? WHERE EXISTS (SELECT 1 FROM desk_recipes WHERE id = ?)`
     ).bind(id, project, title, recipeId, JSON.stringify(SEED_TIMELINE_STATE), now, now, recipeId).run();
     if (!meta.meta || meta.meta.changes !== 1) {
       return { success: false, error: '配方不存在或刚被删掉' };
@@ -101,7 +101,7 @@ export async function deskWindowCreate(env: DeskWindowsEnv, body: any): Promise<
   } catch (err: any) {
     return { success: false, error: err.message };
   }
-  return { success: true, id, project, title, recipe_id: recipeId, note: '', note_depth: 3, state_board: {}, vars: {}, created_at: now, updated_at: now };
+  return { success: true, id, project, title, recipe_id: recipeId, note: '', note_depth: 1, state_board: {}, vars: {}, created_at: now, updated_at: now };
 }
 
 // ===== GET /api/oc/desk/windows?project= =====
@@ -179,8 +179,9 @@ export async function deskWindowUpdate(env: DeskWindowsEnv, id: string, body: an
 
   if (body.title !== undefined && typeof body.title !== 'string') return { success: false, error: 'title 必须是字符串' };
   if (body.note !== undefined && typeof body.note !== 'string') return { success: false, error: 'note 必须是字符串' };
-  if (body.note_depth !== undefined && (typeof body.note_depth !== 'number' || !Number.isFinite(body.note_depth) || body.note_depth < 0)) {
-    return { success: false, error: 'note_depth 必须是 ≥0 的数字' };
+  // 小纸条位置只认两档:1=本楼输入之前,0=本楼输入之后(ST 深度语义)
+  if (body.note_depth !== undefined && body.note_depth !== 0 && body.note_depth !== 1) {
+    return { success: false, error: 'note_depth 只能是 1(输入之前) 或 0(输入之后)' };
   }
   if (body.vars !== undefined && !isPlainObject(body.vars)) return { success: false, error: 'vars 必须是对象' };
   if (body.state_board !== undefined) {

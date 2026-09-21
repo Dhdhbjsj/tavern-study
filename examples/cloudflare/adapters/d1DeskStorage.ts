@@ -22,7 +22,7 @@ function windowFromRow(row: any): DeskWindow {
     title: row.title || '',
     recipeId: row.recipe_id || '',
     note: row.note || '',
-    noteDepth: Number.isInteger(row.note_depth) ? row.note_depth : 3,
+    noteDepth: Number.isInteger(row.note_depth) ? row.note_depth : 1, // 只是防御性兜底;真正的两档归一在 assembleDesk 的 resolveNotePos
     stateBoard: parseObject(row.state_board),
     timelineState: parseObject(row.timeline_state),
     vars: parseObject(row.vars),

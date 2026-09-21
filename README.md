@@ -178,7 +178,7 @@ npm run db:migrate:local
 
 **CPU 限额**：Workers 免费套餐单次调用 CPU 上限约 10ms（按 isolate 滚动宽限），打字桌一楼长回复流式吐几百帧很容易耗尽宽限、长流被中途掐断。若你在 Paid 套餐上遇到断流，在 `wrangler.toml` 加 `[limits] cpu_ms = 300000` 开顶格；免费套餐加了无效，只能升级或接受长回复偶断。
 
-`examples/cloudflare/schema/init.sql` 是给全新数据库用的建表脚本；`examples/cloudflare/schema/migrations/` 下按序号排列的文件是既有数据库的升级路径。给持久化的 D1 数据库跑迁移前请自己先备份。Vectorize 和 Workers AI 绑定是可选的，只在你想开语义检索时才需要；开启时 embedding 模型、向量维度、距离度量三者必须自洽。
+`examples/cloudflare/schema/init.sql` 是给全新数据库用的建表脚本；`examples/cloudflare/schema/migrations/` 下按序号排列的文件是既有数据库的升级路径。用 init.sql 建的库以后要升级，直接照常跑 `d1 migrations apply` 即可——`0001_initial.sql` 建表/建索引/建触发器都带 `IF NOT EXISTS`，对 init.sql 已经建过的库会幂等跳过，不会因为"表已存在"报错，后续迁移文件正常接着跑。给持久化的 D1 数据库跑迁移前请自己先备份。Vectorize 和 Workers AI 绑定是可选的，只在你想开语义检索时才需要；开启时 embedding 模型、向量维度、距离度量三者必须自洽。
 
 ## 安全须知（如实三句）
 

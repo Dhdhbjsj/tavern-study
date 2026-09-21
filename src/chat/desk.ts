@@ -170,7 +170,7 @@ export async function handleDeskChat(
   const project = String(win.project);
   const recipeId = String(win.recipeId);
   const note = String(win.note || '');
-  const noteDepth = Number(win.noteDepth);
+  const noteDepth = win.noteDepth; // 原值透传,由 assembleDesk 里的 resolveNotePos 归一,这里不先转 Number
   const stateBoard = win.stateBoard;
   const windowVars = win.vars;
 

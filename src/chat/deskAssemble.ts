@@ -1,7 +1,8 @@
 // 打字桌装配引擎：assembleDesk 负责装配，deskDryrun 只展示结果、不调用模型。
 // 从远到近：[配方积木前段] → 剧情核心记忆 → 往事区 → 近期章总结 → 时光带 → 近景
 // → [配方积木后段]
-// → 导演小纸条 → 状态板+在场角色卡压轴 → 本楼输入。
+// → 状态板+在场角色卡压轴 → 导演小纸条(位置=1) → 本楼输入 → 导演小纸条(位置=0)。
+// 小纸条只认两档位置:1=贴本楼输入之前,0=贴本楼输入之后;不插进旧楼层之间。
 // 时光带属于故事水流；memories 是世界书/角色卡唯一正本。
 //
 // 队列以 chatHistory 占位块劈两半:前段(pre)进 system 数组、打 cache_control ephemeral 1h(照
@@ -37,7 +38,7 @@ export interface AssembleParams {
   input: string;
   floors?: AssembleFloor[];
   note?: string;
-  noteDepth?: number;
+  noteDepth?: unknown; // 只认数值 0=本楼输入之后,其余(含旧窗口存的其它值/缺省/坏值)一律归 1=输入之前;见 resolveNotePos
   stateBoard?: Record<string, any>;
   vars?: Record<string, string>;
   // 调用方传入已渲染的时光带；本模块不读取其 D1/CAS 状态。
@@ -247,19 +248,16 @@ export function renderStateBoard(board: Record<string, any> | null | undefined):
   return `[状态板]\n${lines.join('\n')}`;
 }
 
-// ===== 导演小纸条按深度插入近景楼层；空楼层由调用方在 afterParts 兜底 =====
-export function spliceNote(
-  floorLines: string[],
-  note: string,
-  depth: number
-): { floorLines: string[]; insertedInFloors: boolean } {
-  if (!note || floorLines.length === 0) {
-    return { floorLines, insertedInFloors: false };
-  }
-  const idx = Math.max(0, floorLines.length - depth);
-  const out = floorLines.slice();
-  out.splice(idx, 0, `[导演小纸条] ${note}`);
-  return { floorLines: out, insertedInFloors: true };
+// ===== 导演小纸条位置:0=本楼输入之后,其余一律 1=本楼输入之前(旧窗口存的其它数值也归 1) =====
+export type NotePos = 0 | 1;
+export function resolveNotePos(raw: unknown): NotePos {
+  return typeof raw === 'number' && raw === 0 ? 0 : 1;
+}
+
+// 状态板之后的收尾三件:小纸条(1)→本楼输入→小纸条(0);空串由调用方过滤,不占位。
+export function tailWithNote(input: string, note: string, pos: NotePos): string[] {
+  const noteLine = note ? `[导演小纸条] ${note}` : '';
+  return pos === 1 ? [noteLine, input] : [input, noteLine];
 }
 
 // ===== assembleDesk:主装配函数(唯一碰 D1/Vectorize 的地方,内部纯逻辑都委托给上面导出的纯函数) =====
@@ -271,8 +269,7 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
   if (!recipeId) return { success: false, error: 'recipeId 必填' };
 
   const floors = Array.isArray(params.floors) ? params.floors : [];
-  const noteDepthRaw = Number(params.noteDepth);
-  const noteDepth = Number.isFinite(noteDepthRaw) && noteDepthRaw >= 0 ? noteDepthRaw : 3;
+  const notePos = resolveNotePos(params.noteDepth);
   const stateBoard = params.stateBoard && typeof params.stateBoard === 'object' ? params.stateBoard : {};
   const windowVars: Record<string, string> = params.vars && typeof params.vars === 'object' ? { ...params.vars } : {};
 
@@ -582,29 +579,25 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
   // 后传进来);没传/传空串按"这窗还没折过"处理,故事流照样连续,不占位糊弄。
   const timelineText = includeHistory && typeof params.timeline === 'string' ? params.timeline : '';
 
-  // 导演纸条按 noteDepth 插入近景楼层；无楼层时放在 post-blocks 后、状态板前。
-  // 深度:本楼输入=0,最后一条楼层=1,往前递增(ST 口径)。
+  // 深度:本楼输入=0,最后一条楼层=1,往前递增(ST 口径,只给上行正则用,跟小纸条位置无关)。
   const floorLines = floors.map((f, i) => {
     const speaker = f.role === 'user' ? ctxUser : ctxChar;
     return `${speaker}：${applyUpRegex(f.content || '', regexRules, floors.length - i)}`;
   });
   const noteText = params.note ? runMacro(String(params.note)) : '';
-  const spliced = spliceNote(floorLines, noteText, noteDepth);
-  const noteInsertedInFloors = spliced.insertedInFloors;
-  const floorsText = includeHistory ? spliced.floorLines.join('\n\n') : '';
+  const floorsText = includeHistory ? floorLines.join('\n\n') : '';
 
   const streamParts = includeHistory
     ? [coreText, pastText, recentText, timelineText, floorsText].filter((s) => s && s.trim())
     : [];
 
-  // ===== 故事流之后:配方积木后段 → 导演小纸条(若没插进近景) → 状态板+压轴角色卡 → 本楼输入 =====
+  // ===== 故事流之后:配方积木后段 → 状态板+压轴角色卡 → 小纸条(1) → 本楼输入 → 小纸条(0) =====
   const afterParts: string[] = [...postTailParts];
-  if (noteText && (!includeHistory || !noteInsertedInFloors)) afterParts.push(`[导演小纸条] ${noteText}`);
 
   const stateBoardText = renderStateBoard(stateBoard);
   if (stateBoardText) afterParts.push(stateBoardText);
 
-  afterParts.push(input); // 本楼输入殿后
+  afterParts.push(...tailWithNote(input, noteText, notePos));
 
   const tail = [...preTailParts, ...streamParts, ...afterParts].filter((s) => s && s.trim()).join('\n\n');
 
