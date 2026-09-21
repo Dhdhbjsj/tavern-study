@@ -308,15 +308,15 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
     return r.text;
   };
 
-  // 上行正则规则(只喂 floors,见 deskMacro.ts 头注释的应用范围铁律)
+  // 上行正则规则(只喂 floors,见 deskMacro.ts 头注释的应用范围铁律)。
+  // 配方名单优先;名单空则退回本预设包+全局的、开着的 up/both 规则(见 storage.ts listUpRegexForPreset)。
   let regexRules: DeskRegexRule[] = [];
-  if (regexIds.length) {
-    try {
-      regexRules = await assets.listRegex(regexIds);
-    } catch (err: any) {
-      return { success: false, error: err.message };
-    }
+  try {
+    regexRules = regexIds.length ? await assets.listRegex(regexIds) : await assets.listUpRegexForPreset(recipe.presetId);
+  } catch (err: any) {
+    return { success: false, error: err.message };
   }
+  const upRegexIds = regexRules.map((r: any) => String(r.id)).filter(Boolean);
 
   // 世界书/角色卡直接读取 memories 本体；category 与 lore_enabled 是入场闸门。
   // ORDER BY id 提供稳定字节序，但不承诺创建顺序；若需要人工顺序应新增 sort_order。
@@ -583,9 +583,10 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
   const timelineText = includeHistory && typeof params.timeline === 'string' ? params.timeline : '';
 
   // 导演纸条按 noteDepth 插入近景楼层；无楼层时放在 post-blocks 后、状态板前。
-  const floorLines = floors.map((f) => {
+  // 深度:本楼输入=0,最后一条楼层=1,往前递增(ST 口径)。
+  const floorLines = floors.map((f, i) => {
     const speaker = f.role === 'user' ? ctxUser : ctxChar;
-    return `${speaker}：${applyUpRegex(f.content || '', regexRules)}`;
+    return `${speaker}：${applyUpRegex(f.content || '', regexRules, floors.length - i)}`;
   });
   const noteText = params.note ? runMacro(String(params.note)) : '';
   const spliced = spliceNote(floorLines, noteText, noteDepth);
@@ -641,6 +642,7 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
       recallCandidates, // 全部候选(含落选的)+分数,给部署者调及格线用
       recallSettings: recall,
       recentChapters: recentChapterNos,
+      upRegexIds, // 这轮真正挂上的上行正则(配方名单或按包默认)
       layers,
       standardSlots,
       totalEst,

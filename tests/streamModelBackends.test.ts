@@ -31,4 +31,9 @@ test('anthropic accepts known terminal reasons and rejects stream errors', async
     const result = await new AnthropicStreamBackend({ apiKey: 'key', fetch: fakeFetch(broken) }).streamChat(args);
     assert.equal(result.ok, false); if (!result.ok) assert.equal(result.kind, 'protocol');
   }
+  const refused = clean.replace('"stop_reason":"end_turn"', '"stop_reason":"refusal"');
+  {
+    const result = await new AnthropicStreamBackend({ apiKey: 'key', fetch: fakeFetch(refused) }).streamChat(args);
+    assert.equal(result.ok, false); if (!result.ok) assert.equal(result.kind, 'refusal');
+  }
 });

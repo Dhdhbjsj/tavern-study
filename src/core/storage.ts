@@ -57,6 +57,8 @@ export interface DeskAssetStorage {
   getRecipe(id: string): Promise<DeskRecipe | null>;
   hasPreset(id: string): Promise<boolean>;
   listRegex(ids: string[]): Promise<DeskRegex[]>;
+  // 配方名单为空时的默认上行正则:本预设包 + 全局的、开着的 up/both 规则,预设优先于全局。
+  listUpRegexForPreset(presetId: string): Promise<DeskRegex[]>;
   listQueueBlocks(presetId: string): Promise<DeskPromptBlock[]>;
   listLore(project: string): Promise<DeskLore[]>;
   importPack(pack: DeskAssetPack): Promise<void>;
@@ -84,6 +86,23 @@ export interface DeskTurnCommit {
   committedAt: string;
 }
 
+// 状态板 stale 自动补算的落库四证:板字节未变 + 窗口 updated_at 未变 + 本楼仍是该窗最新一楼(用
+// 楼层原始 createdAt 卡"更晚"的边界) + 楼层 content/commitToken 未变。任一不成立整体放弃,板沿旧。
+export interface DeskAutoRefreshBoardInput {
+  windowId: string;
+  floorId: string;
+  expectedWindowStateBoard: Record<string, unknown>;
+  expectedWindowUpdatedAt: string;
+  expectedFloorCreatedAt: string;
+  expectedFloorContent: string;
+  expectedFloorCommitToken: string;
+  nextBoard: Record<string, unknown>;
+  nextFloorReport: Record<string, unknown>;
+  refreshedAt: string;
+}
+
+export type DeskAutoRefreshBoardResult = { ok: true } | { ok: false; reason: string };
+
 export interface DeskTurnStorage {
   commitAssistantFloor(windowId: string, floorId: string, commit: DeskTurnCommit): Promise<DeskFloor | null>;
   rollAssistantFloor(input: {
@@ -92,6 +111,7 @@ export interface DeskTurnStorage {
     expected: Pick<DeskFloor, 'content' | 'variants' | 'activeVariant' | 'thinking' | 'report'>;
     commit: DeskTurnCommit;
   }): Promise<DeskFloor | null>;
+  autoRefreshBoard(input: DeskAutoRefreshBoardInput): Promise<DeskAutoRefreshBoardResult>;
 }
 
 export interface StorageAdapter {

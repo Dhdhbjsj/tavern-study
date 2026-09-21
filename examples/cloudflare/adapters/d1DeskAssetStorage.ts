@@ -24,6 +24,14 @@ export class D1DeskAssetStorage implements DeskAssetStorage {
     return (result.results || []).filter((row: any) => ['up', 'down', 'both'].includes(row.direction))
       .map((row: any) => ({ id: row.id, find: row.find, flags: row.flags, replace: row.replace, direction: row.direction, meta: object(row.meta) }));
   }
+  async listUpRegexForPreset(presetId: string): Promise<DeskRegex[]> {
+    const result = await this.db.prepare(
+      `SELECT id, find, flags, replace, direction, meta FROM desk_regex
+        WHERE enabled = 1 AND direction IN ('up', 'both') AND (scope = 'global' OR (scope = 'preset' AND preset_id = ?))
+        ORDER BY CASE scope WHEN 'preset' THEN 0 ELSE 1 END, sort_order, id`,
+    ).bind(presetId).all<any>();
+    return (result.results || []).map((row: any) => ({ id: row.id, find: row.find, flags: row.flags, replace: row.replace, direction: row.direction, meta: object(row.meta) }));
+  }
   async listQueueBlocks(presetId: string): Promise<DeskPromptBlock[]> {
     const result = await this.db.prepare(`SELECT identifier, name, role, content, marker, queue_pos, enabled_default FROM desk_blocks WHERE preset_id = ? AND in_queue = 1`).bind(presetId).all<any>();
     return (result.results || []).map((row: any) => ({ identifier: row.identifier, name: row.name, role: ['user', 'assistant'].includes(row.role) ? row.role : 'system', content: row.content || '', marker: !!row.marker, queuePos: row.queue_pos == null ? null : Number(row.queue_pos), enabledDefault: !!row.enabled_default }));

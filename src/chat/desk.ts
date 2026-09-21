@@ -13,10 +13,11 @@
 //
 // 状态板协议、楼层/窗口原子提交和时光带折叠触发都在此收尾。
 
-import { MODEL_PROFILES } from './models';
-import { makeD1UsageSink } from '../storage/usageSink';
-import { assembleDesk } from './deskAssemble';
-import { loadDeskTimelineState, renderTimelineText, parseDeskTimelineCutoff, maybeFoldDeskTimeline, invalidateDeskTimelineIfFolded, fenceDeskTimelineAfterWrite } from './deskTimeline';
+import { isKnownModel } from './models.ts';
+import { makeD1UsageSink } from '../storage/usageSink.ts';
+import { assembleDesk } from './deskAssemble.ts';
+import { computeBoardFromText } from './deskBoardRefresh.ts';
+import { loadDeskTimelineState, renderTimelineText, parseDeskTimelineCutoff, maybeFoldDeskTimeline, invalidateDeskTimelineIfFolded, fenceDeskTimelineAfterWrite } from './deskTimeline.ts';
 import type { Ai, VectorizeIndex } from '../storage/vectorize';
 import { parseStateBoard as parseCoreStateBoard, STATEBOARD_MAX_BYTES as CORE_STATEBOARD_MAX_BYTES, stateBoardGateErrors } from '../core/stateBoard.ts';
 import type { DeskAssetStorage, DeskStorage, DeskStoryStorage, DeskTurnStorage, SemanticSearchAdapter } from '../core/storage.ts';
@@ -155,7 +156,7 @@ export async function handleDeskChat(
 
   const usageSink = makeD1UsageSink(env);
   const { deskStorage, turnStorage, deskAssets, deskStory, semantic } = storage;
-  const model = params.model && MODEL_PROFILES[params.model] ? params.model : DESK_DEFAULT_MODEL;
+  const model = isKnownModel(params.model) ? params.model : DESK_DEFAULT_MODEL;
 
   // 1) 载入写作窗
   let win: any;
@@ -321,18 +322,23 @@ export async function handleDeskChat(
     const hasUsage = !!usageActual && (usageActual.input + usageActual.output + usageActual.cache_read + usageActual.cache_write) > 0;
     const reportOut = { ...report, stateBoardStale: !boardUsable, ...(boardGateErrors.length ? { stateBoardGateErrors: boardGateErrors } : {}), ...(boardBeforeTrusted ? { boardBefore: effectiveStateBoard } : {}), ...(hasUsage ? { usageActual } : {}), boardAfter: appliedBoard };
     let floorId = '';
+    let floorCreatedAt = '';
+    let committedReport: Record<string, unknown> | null = null;
 
     // 楼层写与窗口板 UPDATE 同事务；任一失败整批回滚，禁止半截态。
     if (mode === 'normal') {
       floorId = genId('fl');
+      floorCreatedAt = now;
       // normal的INSERT不是CAS语句(没有WHERE碰撞条件),窗口UPDATE不需要额外EXISTS守卫——只要
       // INSERT没抛错(主键冲突/瞬时故障会抛错,批内抛错整批回滚,两条都不落),批内第二条必然执行
       // 且必然命中(WHERE id=?只按主键定位,这一行在1)载入写作窗时已经查到过,请求处理期间不会
       // 被并发删除窗口)。
       const committed = await turnStorage.commitAssistantFloor(windowId, floorId, { content, thinking: allThinking.trim() || null, report: reportOut, stateBoard: appliedBoard, committedAt: now });
       if (!committed) throw new Error('写作窗已不存在或提交冲突');
+      committedReport = committed.report;
     } else if (mode === 'roll') {
       floorId = String(lastFloor.id);
+      floorCreatedAt = String(lastFloor.createdAt);
       const inv = await invalidateDeskTimelineIfFolded(env as any, windowId, String(lastFloor.createdAt), floorId);
       if (inv === 'busy') throw new Error('时光带正在被后台折叠,稍等几秒再试');
 
@@ -340,8 +346,41 @@ export async function handleDeskChat(
       // 并发 roll 可能产生相同形状。冲突仍以第一条楼层 CAS 的 changes 判定。
       const committed = await turnStorage.rollAssistantFloor({ windowId, floorId, expected: lastFloor, commit: { content, thinking: allThinking.trim() || null, report: reportOut, stateBoard: appliedBoard, committedAt: now } });
       if (!committed) return { conflict: true };
+      committedReport = committed.report;
 
       await fenceDeskTimelineAfterWrite(env as any, windowId, inv.rev, { createdAt: String(lastFloor.createdAt), id: floorId });
+    }
+
+    // 自动补算:模型这楼没写板/没过闸(stale)时,按本楼正文让模型补一份直接落库。输入板为空算不出,
+    // 跳过。整段 try/catch:本楼已落库,这里任何失败只记日志、照常发 done——不让补算拖垮这一轮。
+    // 落库走 turnStorage.autoRefreshBoard 的四证 CAS(见 core/storage.ts 头注释);commitToken 取自
+    // 刚才 commitAssistantFloor/rollAssistantFloor 回填的 report,不在这里自己造。
+    const commitToken = committedReport && typeof (committedReport as any).commitToken === 'string'
+      ? (committedReport as any).commitToken as string : null;
+    if (!boardUsable && commitToken && content.trim() && Object.keys(effectiveStateBoard).length > 0) {
+      try {
+        // 补算走摘要模型实测半分钟量级,done 会晚这么久——先给前端一条 status 免得像卡死
+        await send({ type: 'status', text: '状态板正在按本楼正文补算一份，约半分钟…' });
+        const auto = await computeBoardFromText(env as any, effectiveStateBoard, content, 'desk-board-auto');
+        if (!auto.ok) {
+          console.error('[desk] 状态板自动补算失败(本楼已落库,板沿旧)', auto.error);
+        } else {
+          const result = await turnStorage.autoRefreshBoard({
+            windowId, floorId,
+            expectedWindowStateBoard: appliedBoard,
+            expectedWindowUpdatedAt: now,
+            expectedFloorCreatedAt: floorCreatedAt,
+            expectedFloorContent: content,
+            expectedFloorCommitToken: commitToken,
+            nextBoard: auto.board,
+            nextFloorReport: { ...reportOut, commitToken, boardAfter: auto.board, stateBoardAutoRefreshed: true },
+            refreshedAt: new Date().toISOString(),
+          });
+          if (!result.ok) console.error('[desk] 状态板自动补算写回被拒:', result.reason);
+        }
+      } catch (e) {
+        console.error('[desk] 状态板自动补算链异常(本楼已落库,板沿旧)', e);
+      }
     }
 
     return { floorId };
@@ -367,7 +406,12 @@ export async function handleDeskChat(
     const usage = result.usage || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     if (!result.ok) {
       failed = result.kind !== 'aborted';
-      if (!clientGone && result.kind !== 'aborted') await send({ type: 'error', error: `模型渠道未正常收尾(${result.kind})，这轮没有存档` });
+      if (!clientGone && result.kind !== 'aborted') {
+        const error = result.kind === 'refusal'
+          ? '这条被上游安全闸拦了(refusal),换个模型再试;这轮没存档'
+          : `模型渠道未正常收尾(${result.kind})，这轮没有存档`;
+        await send({ type: 'error', error });
+      }
     } else {
       try {
         const saved = await finalizeDeskTurn(result.text, result.thinking, { input: usage.input || 0, output: usage.output || 0, cache_read: usage.cacheRead || 0, cache_write: usage.cacheWrite || 0 });

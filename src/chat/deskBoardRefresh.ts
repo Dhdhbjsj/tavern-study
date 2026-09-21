@@ -7,8 +7,8 @@
 // 三条设计上的钉子:
 //   1) **不落库,只回草稿**。这个函数只 return 一份 board,写不写由前端(她点保存)决定——
 //      刷歪了点取消就行,符合本仓"不点保存就不落库"的家法。所以这里一句 UPDATE 都没有。
-//   2) **只对模型写的那楼生效**(部署者拍板)。最后一楼若是她刚发出去、模型还没回的 user 楼,
-//      直接拒绝——那时候"最新正文"是她的指令不是故事正文,拿它更新状态板会把板带偏。
+//   2) **只按模型写的楼算**(部署者拍板)。取最近一条 assistant 楼;刚发出去、模型还没回的 user 楼
+//      跳过不看——那是她的指令不是故事正文,拿它更新状态板会把板带偏。
 //   3) **复用 parseStateBoard**,不自己写第二个解析器。那个函数已经处理过断头围栏
 //      (模型被 max_tokens 腰斩)、8KB 上限、形状校验(只收纯对象、拒数组/基本类型)——
 //      另起炉灶等于把这些坑重踩一遍。所以 prompt 里"用 ```stateboard 围栏、围栏必须在文本末尾"
@@ -17,9 +17,9 @@
 // 模型请求统一收口进 completeText，直连 Anthropic API，不在此复制调用细节。
 // 错误文案与记账仍留本文件——合同层只回结构化终态。
 
-import { makeD1UsageSink } from '../storage/usageSink';
-import { completeText, type CompleteTextUsage } from './modelBackend';
-import { parseStateBoard } from './desk';
+import { makeD1UsageSink } from '../storage/usageSink.ts';
+import { completeText, type CompleteTextUsage } from './modelBackend.ts';
+import { parseStateBoard } from './desk.ts';
 
 interface DeskBoardRefreshEnv {
   OC_DB: D1Database;
@@ -62,7 +62,6 @@ function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
 
 export async function deskBoardRefresh(env: DeskBoardRefreshEnv, windowId: string): Promise<any> {
   if (!windowId) return { success: false, error: '缺 window_id' };
-  const usageSink = makeD1UsageSink(env);
 
   let win: any;
   try {
@@ -72,32 +71,46 @@ export async function deskBoardRefresh(env: DeskBoardRefreshEnv, windowId: strin
   }
   if (!win) return { success: false, error: '这扇窗不存在' };
 
-  // 最后一楼:排序跟 chat/desk.ts 取 lastFloor 那处一模一样(created_at DESC, id DESC),
-  // 两边必须同口径——不然"刷新读的那楼"和"重 roll 覆盖的那楼"会是两楼。
+  // 最近一条 assistant 楼:后面跟着刚发出去、模型还没回的 user 楼也照样能刷(那种楼不当正文喂)。
+  // 排序口径同 chat/desk.ts 取 lastFloor(created_at DESC, id DESC)。
   let floor: any;
   try {
     floor = await env.OC_DB
-      .prepare(`SELECT id, role, content FROM desk_floors WHERE window_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+      .prepare(`SELECT id, content FROM desk_floors WHERE window_id = ? AND role = 'assistant' ORDER BY created_at DESC, id DESC LIMIT 1`)
       .bind(windowId).first<any>();
   } catch (e: any) {
     return { success: false, error: e.message };
   }
-  if (!floor) return { success: false, error: '这扇窗还没有楼层' };
-  // 部署者拍板:只对模型的回复生效。她刚发出去还没生成的那种 user 楼不给刷。
-  if (floor.role !== 'assistant') {
-    return { success: false, error: '最后一楼不是模型写的——刷新只按模型回复的正文重算,先让它写完这楼' };
-  }
+  if (!floor) return { success: false, error: '这扇窗还没有模型写的楼层——刷新只按模型回复的正文重算' };
   const content = String(floor.content || '').trim();
-  if (!content) return { success: false, error: '最后一楼是空的,没有正文可以据此更新' };
+  if (!content) return { success: false, error: '最近一条模型楼是空的,没有正文可以据此更新' };
 
   const board = safeJsonParse<Record<string, any>>(win.state_board, {});
   if (!board || typeof board !== 'object' || Array.isArray(board)) {
     return { success: false, error: '当前状态板不是一个对象,先去状态板面板把它修好再刷新' };
   }
+
+  const r = await computeBoardFromText(env, board, content, 'desk-board-refresh');
+  if (!r.ok) return { success: false, error: r.error };
+  // 只回不写:落库由部署者在状态板面板点保存(见文件头第1条钉子)。floor_id 带回去给前端对账用——
+  // 万一刷新的时候模型又写了一楼,前端能看出这份板是照哪一楼算的。
+  return { success: true, board: r.board, floor_id: floor.id };
+}
+
+// ===== 核心:按(当前板, 正文)让模型重算一份板,过键集/形状闸;只算不写 =====
+// usage 记账渠道由调用方传入,便于区分不同触发来源。
+export type BoardComputeResult = { ok: true; board: Record<string, any> } | { ok: false; error: string };
+export async function computeBoardFromText(
+  env: DeskBoardRefreshEnv,
+  board: Record<string, any>,
+  content: string,
+  channel: 'desk-board-refresh' | 'desk-board-auto' = 'desk-board-refresh',
+): Promise<BoardComputeResult> {
+  const usageSink = makeD1UsageSink(env);
   if (Object.keys(board).length === 0) {
     // 空板刷不出东西:规则2 说"不新增原有状态板不存在的键",一个键都没有的话模型只能干瞪眼。
-    // 明说,别让她按了没反应还以为坏了。
-    return { success: false, error: '当前状态板是空的——刷新是"按最新正文更新已有的键",先让模型写一楼把板立起来' };
+    // 明说,别让部署者按了没反应还以为坏了。
+    return { ok: false, error: '当前状态板是空的——刷新是"按最新正文更新已有的键",先让模型写一楼把板立起来' };
   }
 
   // 正文是小说素材不是指令。这里做的是**结构上的**防伪造(同 deskTimeline 对 <楼层原文> 的处理):
@@ -117,9 +130,9 @@ export async function deskBoardRefresh(env: DeskBoardRefreshEnv, windowId: strin
 
   // 渠道守门(文案主权在本文件,合同层只回结构化终态):缺 key 在动手前拦下。
   if (!env.ANTHROPIC_API_KEY) {
-    console.error('[desk-board-refresh] ANTHROPIC_API_KEY 没配,刷新走不通');
-    await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, undefined, 'failed');
-    return { success: false, error: 'ANTHROPIC_API_KEY 没配' };
+    console.error(`[${channel}] ANTHROPIC_API_KEY 没配,刷新走不通`);
+    await usageSink.logUsage(channel, REFRESH_MODEL, undefined, 'failed');
+    return { ok: false, error: 'ANTHROPIC_API_KEY 没配' };
   }
 
   // 请求统一走 completeText 的超时与终态合同。
@@ -143,9 +156,9 @@ export async function deskBoardRefresh(env: DeskBoardRefreshEnv, windowId: strin
         r.kind === 'http' ? `summary ${r.detail}` :
         r.kind === 'empty' ? `summary ${r.detail || 'empty'}` :
         reason;
-      console.error(`[desk-board-refresh] ${logMsg}`);
-      await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'failed');
-      return { success: false, error: reason };
+      console.error(`[${channel}] ${logMsg}`);
+      await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'failed');
+      return { ok: false, error: reason };
     }
     text = String(r.text);
   }
@@ -153,37 +166,35 @@ export async function deskBoardRefresh(env: DeskBoardRefreshEnv, windowId: strin
   // 跟机器写入路径共用同一个解析器:断头围栏/8KB上限/形状校验全在里头(见文件头第3条钉子)
   const { board: nextBoard } = parseStateBoard(text);
   if (!nextBoard) {
-    await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'failed');
-    return { success: false, error: '模型没有按格式吐出状态板围栏(或者被截断了),再试一次' };
+    await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'failed');
+    return { ok: false, error: '模型没有按格式吐出状态板围栏(或者被截断了),再试一次' };
   }
 
   // parseStateBoard 只保证对象形状和字节上限；字段协议仍须在此校验。
   // 提示词里规则2 白纸黑字要求"字段集合固定、不删键、禁止变更数据类型",但那只是**对模型的请求**
-  // ——模型没照做的时候得有人拦。最险的是它吐个 `{}`:解析成功、前端显示一块空草稿,她一点保存
+  // ——模型没照做的时候得有人拦。最险的是它吐个 `{}`:解析成功、前端显示一块空草稿,一点保存
   // 整块板就没了。所以这里拿输入那份板当尺子,逐项对一遍;对不上宁可这次白刷,也不把歪板递出去。
   const beforeKeys = Object.keys(board);
   const afterKeys = Object.keys(nextBoard);
   const missing = beforeKeys.filter((k) => !Object.prototype.hasOwnProperty.call(nextBoard, k));
   if (missing.length) {
-    await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'failed');
-    return { success: false, error: `重算回来的板少了这些键:${missing.join('、')}——没敢用,再试一次` };
+    await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'failed');
+    return { ok: false, error: `重算回来的板少了这些键:${missing.join('、')}——没敢用,再试一次` };
   }
   const added = afterKeys.filter((k) => !Object.prototype.hasOwnProperty.call(board, k));
   if (added.length) {
-    await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'failed');
-    return { success: false, error: `重算回来的板多出了这些键:${added.join('、')}——没敢用,再试一次` };
+    await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'failed');
+    return { ok: false, error: `重算回来的板多出了这些键:${added.join('、')}——没敢用,再试一次` };
   }
   // 顶层值的"形状档位"要一致:数组 / 纯对象 / 标量三档不许互串。同档里的内容随便它改(那正是
   // 刷新要干的事),但 `关系` 从对象被刷成一句话这种漂移是静默的,回头装配那边才发作。
   const shapeOf = (v: any): string => (Array.isArray(v) ? 'array' : v !== null && typeof v === 'object' ? 'object' : 'scalar');
   const drifted = beforeKeys.filter((k) => shapeOf((board as any)[k]) !== shapeOf((nextBoard as any)[k]));
   if (drifted.length) {
-    await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'failed');
-    return { success: false, error: `这些键的数据类型被改了:${drifted.join('、')}——没敢用,再试一次` };
+    await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'failed');
+    return { ok: false, error: `这些键的数据类型被改了:${drifted.join('、')}——没敢用,再试一次` };
   }
 
-  await usageSink.logUsage('desk-board-refresh', REFRESH_MODEL, apiUsage, 'ok');
-  // 只回不写:落库由她在状态板面板点保存(见文件头第1条钉子)。floor_id 带回去给前端对账用——
-  // 万一她按刷新的时候模型又写了一楼,前端能看出这份板是照哪一楼算的。
-  return { success: true, board: nextBoard, floor_id: floor.id };
+  await usageSink.logUsage(channel, REFRESH_MODEL, apiUsage, 'ok');
+  return { ok: true, board: nextBoard };
 }

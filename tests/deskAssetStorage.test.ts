@@ -25,6 +25,22 @@ test('serves desk assembly assets without Cloudflare or a database', async () =>
   assert.equal(lore[1].position, 'broken');
 });
 
+test('empty regex list falls back to preset+global, only up/both/enabled rules, preset before global', async () => {
+  const storage = createMemoryStorage({
+    deskPresetIds: ['preset', 'other'],
+    deskRegex: [
+      { id: 'g-down', find: 'x', flags: '', replace: 'y', direction: 'down', meta: {}, scope: 'global', sortOrder: 0 },
+      { id: 'g-off', find: 'x', flags: '', replace: 'y', direction: 'both', meta: {}, scope: 'global', enabled: false, sortOrder: 1 },
+      { id: 'g1', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'global', sortOrder: 2 },
+      { id: 'p1', find: 'x', flags: '', replace: 'y', direction: 'both', meta: {}, scope: 'preset', presetId: 'preset', sortOrder: 1 },
+      { id: 'p0', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'preset', sortOrder: 0 },
+      { id: 'other-preset', find: 'x', flags: '', replace: 'y', direction: 'up', meta: {}, scope: 'preset', presetId: 'other', sortOrder: 0 },
+    ],
+  });
+  const ids = (await storage.deskAssets.listUpRegexForPreset('preset')).map((row) => row.id);
+  assert.deepEqual(ids, ['p0', 'p1', 'g1']);
+});
+
 test('returns cloned asset values rather than exposing adapter state', async () => {
   const storage = createMemoryStorage({ deskPresetIds: ['p'], deskRecipes: [
     { id: 'r', presetId: 'p', weight: 'heavy', overrides: {}, regexIds: ['x'], lightSystem: '' },

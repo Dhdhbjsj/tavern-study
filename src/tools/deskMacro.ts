@@ -123,7 +123,16 @@ export interface DeskRegexRule {
   flags: string;
   replace: string;
   direction: 'up' | 'down' | 'both';
-  meta?: { invalid?: boolean; unsafe?: boolean; [k: string]: any };
+  meta?: { invalid?: boolean; unsafe?: boolean; minDepth?: number | null; maxDepth?: number | null; [k: string]: any };
+}
+
+// 深度语义:depth 0=本楼输入,1=上一楼,往前递增;规则带 minDepth/maxDepth 只在区间内跑。
+export function ruleAppliesAtDepth(rule: DeskRegexRule, depth: number): boolean {
+  const min = rule.meta?.minDepth;
+  const max = rule.meta?.maxDepth;
+  if (typeof min === 'number' && Number.isFinite(min) && depth < min) return false;
+  if (typeof max === 'number' && Number.isFinite(max) && depth > max) return false;
+  return true;
 }
 
 // ReDoS 爆炸半径上限(工单 Fix2a):单块文本封顶 UP_REGEX_CAP 字才喂进正则管道,超出部分原样
@@ -141,7 +150,8 @@ function translateReplaceString(replace: string): string {
   return String(replace || '').replace(/\{\{match\}\}/g, () => '$&');
 }
 
-export function applyUpRegex(text: string, rules: DeskRegexRule[]): string {
+// depth 不传=不按深度筛(全部规则都跑)。
+export function applyUpRegex(text: string, rules: DeskRegexRule[], depth?: number): string {
   const full = String(text || '');
   // 超长楼层文本封顶,只把前 UP_REGEX_CAP 字喂进正则管道,后面原样拼回去(见上方常量注释)
   const capped = full.length > UP_REGEX_CAP;
@@ -149,7 +159,8 @@ export function applyUpRegex(text: string, rules: DeskRegexRule[]): string {
   const remainder = capped ? full.slice(UP_REGEX_CAP) : '';
   for (const rule of rules || []) {
     if (rule.direction !== 'up' && rule.direction !== 'both') continue;
-    if (rule.meta?.invalid) continue; // S1 落库时已经把编译不过的正则降级禁用+标 invalid,这里跳过不是防御性冗余
+    if (typeof depth === 'number' && !ruleAppliesAtDepth(rule, depth)) continue;
+    if (rule.meta?.invalid) continue; // 落库时已经把编译不过的正则降级禁用+标 invalid,这里跳过不是防御性冗余
     if (isPatternUnsafe(rule.find)) continue; // 纵深防御(工单Fix2b):import 时该摁灭的已经enabled=0进不来这个数组,
     // 这里再挡一道是防"绕开导入路径直接塞规则"(测试构造/以后新入口)——同一形状不该有两条判定逻辑,直接复用 desk.ts 那份。
     try {

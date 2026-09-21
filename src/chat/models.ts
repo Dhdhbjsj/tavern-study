@@ -23,10 +23,15 @@ export const MODEL_PROFILES: Record<string, ModelProfile> = {
   'claude-sonnet-4-5': { thinking: 'extended', effort: false, maxTokens: 32000 }, // Sonnet 4.5 不支持 effort
 };
 
+// 模型白名单判定:只认自有键,"toString"/"__proto__" 这类原型链上的名字不算
+export function isKnownModel(id: unknown): id is string {
+  return typeof id === 'string' && Object.hasOwn(MODEL_PROFILES, id);
+}
+
 // 拼出请求体里跟"模型差异"相关的那部分(model / max_tokens / thinking / effort)
 export function buildModelParams(model: string): Record<string, any> {
   // 不认识的模型名整个夹回默认值——否则 model 字符串原样发出去会 404
-  const id = MODEL_PROFILES[model] ? model : DEFAULT_MODEL;
+  const id = isKnownModel(model) ? model : DEFAULT_MODEL;
   const p = MODEL_PROFILES[id];
   const params: Record<string, any> = { model: id, max_tokens: p.maxTokens, stream: true };
 

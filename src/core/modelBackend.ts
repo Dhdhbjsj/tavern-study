@@ -17,7 +17,7 @@ export interface StreamChatArgs {
 export type StreamChatResult =
   // Backends may return this variant only after their protocol-specific clean terminal was observed.
   | { ok: true; terminal: 'clean'; text: string; thinking: string; usage: ModelUsage; stopReason?: string }
-  | { ok: false; kind: 'config' | 'http' | 'timeout' | 'aborted' | 'protocol' | 'limit' | 'empty' | 'fetch'; detail?: string; usage?: ModelUsage };
+  | { ok: false; kind: 'config' | 'http' | 'timeout' | 'aborted' | 'protocol' | 'refusal' | 'limit' | 'empty' | 'fetch'; detail?: string; usage?: ModelUsage };
 
 export interface ModelBackend {
   // An aborted request must never resolve to the successful clean-terminal variant.

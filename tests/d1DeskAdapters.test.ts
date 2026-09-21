@@ -62,6 +62,7 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     await assets.importPack({ project: 'P', name: 'Light', recipe: { id: 'r', presetId: 'p', weight: 'light', overrides: {}, regexIds: ['rx'], lightSystem: 'Continue.' }, blocks: [{ identifier: 'main', name: 'Main', role: 'system', content: 'x', marker: false, queuePos: 0, enabledDefault: true }], regex: [{ id: 'rx', find: 'x', replace: 'y', flags: 'g', direction: 'up', meta: {} }] });
     assert.equal((await assets.getRecipe('r'))?.lightSystem, 'Continue.');
     assert.equal((await assets.listQueueBlocks('p')).length, 1);
+    assert.deepEqual((await assets.listUpRegexForPreset('p')).map((row) => row.id), ['rx']);
 
     const reading = new D1ReadingStorage(db);
     await reading.createChapter({ id: 'ch', project: 'P', chapterNo: '1', title: 'One', content: 'Body', summary: '', status: 'draft', createdAt: 't0', updatedAt: 't0', publishedAt: null });

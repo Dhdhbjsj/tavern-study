@@ -1,4 +1,4 @@
-import type { DeskAssetPack, DeskAssetStorage, DeskStorage, DeskStoryStorage, DeskTurnCommit, DeskTurnStorage, ReadingStorage, StorageAdapter, StudyListQuery, StudyStats, StudyStorage } from '../core/storage.ts';
+import type { DeskAssetPack, DeskAssetStorage, DeskAutoRefreshBoardInput, DeskAutoRefreshBoardResult, DeskStorage, DeskStoryStorage, DeskTurnCommit, DeskTurnStorage, ReadingStorage, StorageAdapter, StudyListQuery, StudyStats, StudyStorage } from '../core/storage.ts';
 import type { Chapter, ChapterComment, DeskFloor, DeskLore, DeskPromptBlock, DeskRecipe, DeskRegex, DeskWindow, StudyEntry } from '../core/types.ts';
 
 export interface MemorySeed {
@@ -9,7 +9,8 @@ export interface MemorySeed {
   deskFloors?: DeskFloor[];
   deskRecipes?: DeskRecipe[];
   deskPresetIds?: string[];
-  deskRegex?: DeskRegex[];
+  // scope/presetId/enabled/sortOrder 只给 listUpRegexForPreset 的默认名单逻辑用,其余读取按原样兼容。
+  deskRegex?: Array<DeskRegex & { scope?: 'preset' | 'global'; presetId?: string; enabled?: boolean; sortOrder?: number }>;
   deskBlocks?: Array<DeskPromptBlock & { presetId: string }>;
   deskLore?: Array<DeskLore & { project: string }>;
   deskState?: Record<string, string>;
@@ -29,6 +30,17 @@ export class MemoryDeskAssetStorage implements DeskAssetStorage {
   async getRecipe(id: string) { const row = this.seed.deskRecipes?.find((x) => x.id === id); return row ? structuredClone(row) : null; }
   async hasPreset(id: string) { return !!this.seed.deskPresetIds?.includes(id); }
   async listRegex(ids: string[]) { return (this.seed.deskRegex || []).filter((x) => ids.includes(x.id)).map((x) => structuredClone(x)); }
+  // 配方名单为空时的默认名单:本预设包 + 全局的、开着的 up/both 规则,预设优先于全局,组内按 sortOrder、id。
+  async listUpRegexForPreset(presetId: string) {
+    const scopeRank = (scope: 'preset' | 'global') => (scope === 'preset' ? 0 : 1);
+    return (this.seed.deskRegex || [])
+      .filter((x) => (x.enabled ?? true) && (x.direction === 'up' || x.direction === 'both')
+        && ((x.scope ?? 'global') === 'global' || ((x.scope ?? 'global') === 'preset' && x.presetId === presetId)))
+      .sort((a, b) => scopeRank(a.scope ?? 'global') - scopeRank(b.scope ?? 'global')
+        || (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0)
+        || a.id.localeCompare(b.id))
+      .map(({ scope: _scope, presetId: _presetId, enabled: _enabled, sortOrder: _sortOrder, ...x }) => structuredClone(x));
+  }
   async listQueueBlocks(presetId: string) { return (this.seed.deskBlocks || []).filter((x) => x.presetId === presetId).map(({ presetId: _presetId, ...x }) => structuredClone(x)); }
   async listLore(project: string) { return (this.seed.deskLore || []).filter((x) => x.project === project).sort((a, b) => a.id.localeCompare(b.id)).map(({ project: _project, ...x }) => structuredClone(x)); }
   async importPack(pack: DeskAssetPack) {
@@ -79,6 +91,27 @@ export class MemoryDeskStorage implements DeskStorage, DeskTurnStorage {
     const next: DeskFloor = { ...floor, content: input.commit.content, variants, activeVariant: variants.length - 1, thinking: input.commit.thinking, report };
     this.floors.set(floor.id, next); this.windows.set(window.id, { ...window, stateBoard: structuredClone(input.commit.stateBoard), updatedAt: input.commit.committedAt });
     return structuredClone(next);
+  }
+  // 四证核对全部通过才写:窗口板字节+updated_at 未变,本楼仍是该窗最新一楼(按 createdAt 判断,同
+  // 见文件顶 floorOrder),楼层 content/commitToken 未变。任一不成立原样放弃,不留半截态。
+  async autoRefreshBoard(input: DeskAutoRefreshBoardInput): Promise<DeskAutoRefreshBoardResult> {
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    const window = this.windows.get(input.windowId);
+    if (!window) return { ok: false, reason: 'window not found' };
+    if (!same(window.stateBoard, input.expectedWindowStateBoard) || window.updatedAt !== input.expectedWindowUpdatedAt) {
+      return { ok: false, reason: 'window state board/updated_at changed since this turn committed' };
+    }
+    const floor = this.floors.get(input.floorId);
+    if (!floor || floor.windowId !== input.windowId) return { ok: false, reason: 'floor not found' };
+    const laterFloorExists = [...this.floors.values()].some((f) => f.windowId === input.windowId
+      && (f.createdAt > input.expectedFloorCreatedAt || (f.createdAt === input.expectedFloorCreatedAt && f.id > input.floorId)));
+    if (laterFloorExists) return { ok: false, reason: 'this floor is no longer the window\'s latest' };
+    if (floor.content !== input.expectedFloorContent || (floor.report as any)?.commitToken !== input.expectedFloorCommitToken) {
+      return { ok: false, reason: 'floor content/commitToken changed mid-flight' };
+    }
+    this.windows.set(input.windowId, { ...window, stateBoard: structuredClone(input.nextBoard), updatedAt: input.refreshedAt });
+    this.floors.set(input.floorId, { ...floor, report: structuredClone(input.nextFloorReport) });
+    return { ok: true };
   }
 }
 
