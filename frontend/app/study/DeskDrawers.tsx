@@ -23,7 +23,7 @@ import { useStudyShell } from './studyShell';
 
 // ── 数据形状(照后端 tools/deskPanels.ts / tools/desk.ts / tools/deskRecipes.ts / tools/study.ts 的真实返回来)──
 type Weight = 'light' | 'heavy';
-type PresetSummary = { id: string; name: string; block_count: number; queue_count: number; library_count: number; created_at: string };
+type PresetSummary = { id: string; name: string; block_count: number; queue_count: number; library_count: number; created_at: string; params?: any };
 type BlockRow = {
   id: string; identifier: string; name: string; role: string; marker: boolean;
   in_queue: boolean; queue_pos: number | null; enabled_default: boolean;
@@ -207,13 +207,9 @@ function BlocksTab({ base, envOk, project, currentRecipeId, onDirtyChange, onReg
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dirty, recipeId]);
 
-  // 把"有没有没保存的配方草稿"报给外层抽屉壳(Escape 关闭判断用)——卸载(切标签页/关抽屉)
-  // 时清 false,因为草稿本身(local state)也跟着这次卸载一起没了,不该继续占着"脏"位子。
-  useEffect(() => {
-    onDirtyChange?.(dirty || hasBlockDrafts);
-    return () => onDirtyChange?.(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dirty, hasBlockDrafts]);
+  // 把"有没有没保存的草稿(配方/积木/思考栏标签三路都算)"报给外层抽屉壳(Escape 关闭判断用)——
+  // 卸载(切标签页/关抽屉)时清 false,因为草稿本身(local state)也跟着这次卸载一起没了,不该继续占着
+  // "脏"位子。挪到 thinkingTagsDirty 定义之后(见下方那份),声明顺序要求它在场才能用。
 
   // 就地建配方(照 TypingDesk.tsx openMiniCreate 同款,精简版)
   // 预设包列表独立加载/独立报错——原先跟配方列表拼在同一个 Promise.all 里静默吞失败(pRes.ok
@@ -599,6 +595,97 @@ function BlocksTab({ base, envOk, project, currentRecipeId, onDirtyChange, onReg
   const [presetBlockContentOpen, setPresetBlockContentOpen] = useState<Record<string, boolean>>({});
   const [presetDeleteError, setPresetDeleteError] = useState<Record<string, string>>({});
   const [presetDeleteBusy, setPresetDeleteBusy] = useState<string | null>(null);
+
+  // 改道思考栏标签:每包一份草稿/保存态,PATCH /api/oc/desk/presets/:id 落 params.thinkingTags
+  const [thinkingTagsDraft, setThinkingTagsDraft] = useState<Record<string, string>>({});
+  const [thinkingTagsSaving, setThinkingTagsSaving] = useState<Record<string, boolean>>({});
+  const [thinkingTagsError, setThinkingTagsError] = useState<Record<string, string>>({});
+  const [thinkingTagsSaved, setThinkingTagsSaved] = useState<Record<string, boolean>>({});
+  const [thinkingTagsHelpOpen, setThinkingTagsHelpOpen] = useState<Record<string, boolean>>({});
+  // 按预设 id 各自一条请求序号:乱序响应(慢的旧请求后回来)按 seq 核对丢弃,不许覆盖新提交的结果/草稿
+  const thinkingTagsSeqRef = useRef<Record<string, number>>({});
+  // "已保存"2秒闪字的计时器句柄,按预设 id 存,安排新的前先清旧的;组件卸载时统一清空
+  const thinkingTagsTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  // thinkingTagsDraft 的 ref 镜像:onChange 时跟 state 同步写,save 的异步回调里靠它读"回来那一刻
+  // 输入框到底是什么"——直接读 state 会拿到发请求那一帧的闭包旧值,读不到保存路上用户又打的新字。
+  const thinkingTagsDraftRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    const timers = thinkingTagsTimerRef.current;
+    return () => { Object.values(timers).forEach((t) => clearTimeout(t)); };
+  }, []);
+
+  function parseThinkingTags(s: string): string[] {
+    return s.split(/[,，、]/).map((t) => t.trim()).filter(Boolean);
+  }
+  function thinkingTagsText(p: PresetSummary): string {
+    const draft = thinkingTagsDraft[p.id];
+    if (draft !== undefined) return draft;
+    return Array.isArray(p.params?.thinkingTags) ? p.params.thinkingTags.join(', ') : '';
+  }
+  function thinkingTagsDirty(p: PresetSummary): boolean {
+    const cur = Array.isArray(p.params?.thinkingTags) ? p.params.thinkingTags : [];
+    const next = parseThinkingTags(thinkingTagsText(p));
+    return JSON.stringify(cur) !== JSON.stringify(next);
+  }
+  // 输入框改字的唯一入口:state+ref 一起写,并顺手撤销这个包过期的"已保存"闪字与它的计时器
+  // (还在飞的保存哪怕后面判定 draftUntouched 成立,这一下已经打断了"没再碰过"的连续性)。
+  function editThinkingTagsDraft(id: string, value: string) {
+    thinkingTagsDraftRef.current[id] = value;
+    setThinkingTagsDraft((prev) => ({ ...prev, [id]: value }));
+    if (thinkingTagsTimerRef.current[id]) { clearTimeout(thinkingTagsTimerRef.current[id]); delete thinkingTagsTimerRef.current[id]; }
+    setThinkingTagsSaved((prev) => (prev[id] ? { ...prev, [id]: false } : prev));
+  }
+  function clearThinkingTagsDraft(id: string) {
+    delete thinkingTagsDraftRef.current[id];
+    setThinkingTagsDraft((prev) => { const next = { ...prev }; delete next[id]; return next; });
+  }
+  async function saveThinkingTags(p: PresetSummary) {
+    if (thinkingTagsSaving[p.id]) return; // 并发闸:这个预设已经有一笔在飞,别再开第二笔
+    const submitted = thinkingTagsText(p); // 快照这次提交时输入框的原始文本,响应回来后只跟这份比对
+    const tags = parseThinkingTags(submitted);
+    const seq = (thinkingTagsSeqRef.current[p.id] = (thinkingTagsSeqRef.current[p.id] || 0) + 1);
+    setThinkingTagsSaving((prev) => ({ ...prev, [p.id]: true }));
+    setThinkingTagsError((prev) => ({ ...prev, [p.id]: '' }));
+    try {
+      if (!envOk) throw new Error('环境变量没配好');
+      const res = await fetch(`${base}/api/oc/desk/presets/${p.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ thinking_tags: tags }),
+      });
+      const d = await res.json().catch(() => null);
+      if (thinkingTagsSeqRef.current[p.id] !== seq) return; // 已经被更晚一笔提交盖过,这笔响应作废,连 busy 都不清
+      if (!res.ok || !d || d.success !== true) throw new Error(d?.error || '保存失败');
+      setPresets((prev) => prev.map((x) => (x.id === p.id ? { ...x, params: d.preset?.params ?? x.params } : x)));
+      // 只在"回来这一刻的草稿"还等于这次提交时的文本(或压根没再改过)才清草稿+闪已保存——保存这
+      // 一路上用户又手速改了输入框,新草稿不许被吞,也不该给一笔"没保存过新字"的响应挂"已保存"。
+      const currentDraft = thinkingTagsDraftRef.current[p.id];
+      const draftUntouched = currentDraft === submitted || currentDraft === undefined;
+      if (draftUntouched) {
+        clearThinkingTagsDraft(p.id);
+        setThinkingTagsSaved((prev) => ({ ...prev, [p.id]: true }));
+        if (thinkingTagsTimerRef.current[p.id]) clearTimeout(thinkingTagsTimerRef.current[p.id]);
+        thinkingTagsTimerRef.current[p.id] = setTimeout(() => {
+          setThinkingTagsSaved((prev) => ({ ...prev, [p.id]: false }));
+          delete thinkingTagsTimerRef.current[p.id];
+        }, 2000);
+      }
+    } catch (e: any) {
+      if (thinkingTagsSeqRef.current[p.id] !== seq) return; // 同上:过期请求的报错也不许覆盖更新的状态
+      setThinkingTagsError((prev) => ({ ...prev, [p.id]: e.message || '保存失败' }));
+    } finally {
+      if (thinkingTagsSeqRef.current[p.id] === seq) setThinkingTagsSaving((prev) => ({ ...prev, [p.id]: false }));
+    }
+  }
+
+  // 三路草稿(配方/积木/思考栏标签)汇总成一个"脏"信号报给外层抽屉壳,声明顺序要求排在
+  // thinkingTagsDirty 之后。卸载时清 false,理由同上——三路草稿都是 local state,跟着卸载一起没了。
+  const hasThinkingTagDrafts = presets.some((p) => thinkingTagsDraft[p.id] !== undefined && thinkingTagsDirty(p));
+  useEffect(() => {
+    onDirtyChange?.(dirty || hasBlockDrafts || hasThinkingTagDrafts);
+    return () => onDirtyChange?.(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty, hasBlockDrafts, hasThinkingTagDrafts]);
 
   async function togglePresetExpand(id: string) {
     const willOpen = !presetExpanded[id];
@@ -1055,6 +1142,41 @@ function BlocksTab({ base, envOk, project, currentRecipeId, onDirtyChange, onReg
                   </div>
                   {/* 删除反馈挂在行下面,不管展不展开都看得到——删除现在是行级动作,不该被锁进展开态里 */}
                   {presetDeleteError[p.id] && <div style={{ padding: '0 14px 10px', fontSize: 11.5, color: errColor }}>{presetDeleteError[p.id]}</div>}
+                  {/* 改道思考栏标签:行级常驻(不依赖展开),点行只切展开态,这里单独 stopPropagation */}
+                  <div style={{ padding: '0 14px 12px' }} onClick={(e) => e.stopPropagation()}>
+                    <div style={{ fontSize: 11, color: 'var(--ink2)', marginBottom: 4 }}>改道思考栏的标签</div>
+                    <input
+                      type="text"
+                      value={thinkingTagsText(p)}
+                      onChange={(e) => editThinkingTagsDraft(p.id, e.target.value)}
+                      placeholder="如：分镜, 准备稿"
+                      style={{ ...inputStyle, width: '100%', boxSizing: 'border-box' }}
+                    />
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                      <button
+                        onClick={() => saveThinkingTags(p)}
+                        disabled={!!thinkingTagsSaving[p.id] || !thinkingTagsDirty(p)}
+                        style={{ ...btnPrimaryStyle, fontSize: 11.5, padding: '6px 12px', opacity: (thinkingTagsSaving[p.id] || !thinkingTagsDirty(p)) ? 0.5 : 1 }}
+                      >
+                        {thinkingTagsSaving[p.id] ? '保存中…' : '保存'}
+                      </button>
+                      {thinkingTagsSaved[p.id] && <span style={{ fontSize: 11, color: 'var(--ink2)' }}>已保存</span>}
+                    </div>
+                    {thinkingTagsError[p.id] && <div style={{ fontSize: 11.5, color: errColor, marginTop: 4 }}>{thinkingTagsError[p.id]}</div>}
+                    <button
+                      onClick={() => setThinkingTagsHelpOpen((prev) => ({ ...prev, [p.id]: !prev[p.id] }))}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', fontSize: 11, color: 'var(--ink2)', padding: '4px 0', textDecoration: 'underline' }}
+                    >
+                      {thinkingTagsHelpOpen[p.id] ? '这是什么？▲' : '这是什么？▼'}
+                    </button>
+                    {thinkingTagsHelpOpen[p.id] && (
+                      <div style={{ fontSize: 12, color: 'var(--ink2)', lineHeight: 1.6, marginTop: 4 }}>
+                        {'预设里让模型在正文前输出的清单块（常见叫法 CoT），把它的标签名填在这里。模型输出时这个块会整段进思考栏：不进正文、不回喂给模型、不进时光带摘要。多个名字用逗号分隔，留空只认 thinking。'}
+                        <br />
+                        {'新一代模型对"思考"类措辞敏感，可能整轮拒答。建议把块名和积木里的文案都换成中性词（如 分镜、准备稿），写成"先输出一个 <分镜> 块，逐项写出结论，再写正文"这样的输出格式要求。标签需独占一行、不带空格或属性；再配一条上行正则 ^[\\s\\S]*?</分镜>\\s* 兜底（不依赖 dotAll，标签独占一行也能吃掉整个块）。'}
+                      </div>
+                    )}
+                  </div>
                   {expanded && (
                     <div style={{ padding: '0 14px 12px' }}>
                       {!cache || cache.loading ? (

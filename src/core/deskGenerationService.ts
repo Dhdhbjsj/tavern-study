@@ -25,6 +25,9 @@ export interface GenerateDeskTurnInput {
   committedAt: string;
   signal?: AbortSignal;
   onEvent?: (event: ModelStreamEvent) => void | Promise<void>;
+  // 字面思考标签名单(见 shared/text.ts createLiteralThinkingSplitter);由调用方(TavernStudyHost)
+  // 从 assembleDesk 装配结果里取,空退默认——这里只管透传给后端,不替调用方决定默认值。
+  thinkingTags?: string[];
 }
 
 export class DeskGenerationService {
@@ -34,7 +37,7 @@ export class DeskGenerationService {
     if (input.mode === 'roll' && !input.expectedFloor) return { success: false, error: 'Roll target is required.' };
     if (input.mode === 'normal' && !input.userFloor) return { success: false, error: 'User floor is required.' };
     if (input.signal?.aborted) return { success: false, error: 'aborted' };
-    const generated = await this.backend.streamChat({ system: input.system, prompt: input.prompt, model: input.model, signal: input.signal, onEvent: input.onEvent });
+    const generated = await this.backend.streamChat({ system: input.system, prompt: input.prompt, model: input.model, signal: input.signal, onEvent: input.onEvent, thinkingTags: input.thinkingTags });
     if (!generated.ok) return { success: false, error: generated.kind, detail: generated.detail, usage: generated.usage };
     if (input.signal?.aborted) return { success: false, error: 'aborted', usage: generated.usage };
     const parsed = parseStateBoard(generated.text);

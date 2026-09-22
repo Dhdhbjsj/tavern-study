@@ -17,6 +17,7 @@ import type { DeskRegexRule } from '../tools/deskMacro.ts';
 import { addMentionedCharactersToPresence, buildLoreScanCorpus, resolveAtMentionIds } from '../core/loreTrigger.ts';
 import { DESK_TIMELINE_KEEP } from '../core/deskLimits.ts';
 import type { DeskAssetStorage, DeskStoryStorage, SemanticSearchAdapter } from '../core/storage.ts';
+import { effectiveThinkingTags } from '../tools/deskThinkingTags.ts';
 
 export interface DeskAssembleEnv {
   OC_DB?: D1Database;
@@ -287,11 +288,16 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
   }
   if (!recipe) return { success: false, error: '配方不存在' };
 
+  // 分流器标签名单与装配同一快照的预设,不另读一次,免得中途换预设错配——顺带替代掉原先单独的
+  // hasPreset 存在性检查(null=不存在)。
+  let presetParams: unknown;
   try {
-    if (!await assets.hasPreset(recipe.presetId)) return { success: false, error: '配方绑定的预设包不存在' };
+    presetParams = await assets.getPresetParams(recipe.presetId);
   } catch (err: any) {
     return { success: false, error: err.message };
   }
+  if (presetParams === null) return { success: false, error: '配方绑定的预设包不存在' };
+  const thinkingTags = effectiveThinkingTags(presetParams);
 
   const overrides = recipe.overrides;
   const regexIds = recipe.regexIds;
@@ -628,6 +634,7 @@ export async function assembleDesk(env: DeskAssembleEnv, params: AssembleParams)
     success: true,
     system,
     tail,
+    thinkingTags, // 与本轮装配同快照的预设标签名单(恒含 thinking)
     report: {
       blocks: blocksReport,
       loreHits,

@@ -64,6 +64,12 @@ test('D1 desk adapters preserve atomic commits, conflicts, malformed JSON, and c
     assert.equal((await assets.listQueueBlocks('p')).length, 1);
     assert.deepEqual((await assets.listUpRegexForPreset('p')).map((row) => row.id), ['rx']);
 
+    // getPresetParams: raw params column value for an existing preset, null when the id is missing.
+    assert.equal(await assets.getPresetParams('p'), '{}');
+    assert.equal(await assets.getPresetParams('nope'), null);
+    await db.prepare(`UPDATE desk_presets SET params = ? WHERE id = 'p'`).bind(JSON.stringify({ thinkingTags: ['分镜'] })).run();
+    assert.deepEqual(JSON.parse(String(await assets.getPresetParams('p'))), { thinkingTags: ['分镜'] });
+
     // Same-sortOrder tie-break must match SQLite's BINARY (UTF-8 byte) order: a supplementary-plane
     // id (U+10000) sorts AFTER a private-use-area id (U+E000) here — verifies the memory adapter's
     // ordinalCompare (see tests/deskAssetStorage.test.ts) actually agrees with real D1 on this pair,

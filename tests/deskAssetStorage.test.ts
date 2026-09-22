@@ -25,6 +25,16 @@ test('serves desk assembly assets without Cloudflare or a database', async () =>
   assert.equal(lore[1].position, 'broken');
 });
 
+test('getPresetParams: null for missing preset, seeded params for existing, {} default when unseeded', async () => {
+  const storage = createMemoryStorage({
+    deskPresetIds: ['preset', 'bare'],
+    deskPresetParams: { preset: { thinkingTags: ['分镜'] } },
+  });
+  assert.deepEqual(await storage.deskAssets.getPresetParams('preset'), { thinkingTags: ['分镜'] });
+  assert.deepEqual(await storage.deskAssets.getPresetParams('bare'), {});
+  assert.equal(await storage.deskAssets.getPresetParams('nope'), null);
+});
+
 test('empty regex list falls back to preset+global, only up/both/enabled rules, preset before global', async () => {
   const storage = createMemoryStorage({
     deskPresetIds: ['preset', 'other'],

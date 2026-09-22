@@ -10,7 +10,7 @@ import type { Ai, VectorizeIndex } from '../../src/storage/vectorize';
 import type { SemanticSearchAdapter } from '../../src/core/storage.ts';
 import {
   deskImportPreset, deskImportSettings, deskImportWorlds, deskImportRegexBundle, importCharacterCard,
-  deskListPresets, deskPresetDelete, deskListRegex, deskBackfillChapterVectors,
+  deskListPresets, deskPresetDelete, deskPresetUpdate, deskListRegex, deskBackfillChapterVectors,
 } from '../../src/tools/desk';
 import { parseCharacterCard } from '../../src/core/characterCard.ts';
 import {
@@ -67,7 +67,7 @@ function corsHeaders(request: Request, env: Env): HeadersInit {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -422,6 +422,17 @@ async function handleDeskAdmin(request: Request, env: Env, url: URL, ctx: Execut
     if (!id) return json(request, env, { success: false, error: 'missing id' }, 400);
     const r = await deskPresetDelete(env as any, id);
     return json(request, env, r, r.success ? 200 : (r.error === 'Preset pack not found.' ? 404 : (r.server === true ? 500 : 400)));
+  }
+  // 改预设包 params(目前只开放思考栏标签名单一扇窗)；方法不同天然不与上面 GET /blocks、DELETE 冲突。
+  if (url.pathname.startsWith('/api/oc/desk/presets/') && request.method === 'PATCH') {
+    let id = '';
+    try { id = decodeURIComponent(url.pathname.slice('/api/oc/desk/presets/'.length)); }
+    catch { return json(request, env, { success: false, error: '预设包 id 编码不合法' }, 400); }
+    if (!id) return json(request, env, { success: false, error: 'missing id' }, 400);
+    const read = await deskReadJsonLimited(request, { maxBytes: DESK_TINY_BODY_MAX });
+    if ('resp' in read) return read.resp;
+    const r = await deskPresetUpdate(env as any, id, read.body);
+    return json(request, env, r, r.success ? 200 : (r.error === '预设包不存在' ? 404 : (r.server ? 500 : 400)));
   }
 
   // ----- global/preset regex -----

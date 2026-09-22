@@ -18,6 +18,10 @@ export class D1DeskAssetStorage implements DeskAssetStorage {
     return row ? { id: row.id, presetId: row.preset_id, weight: row.weight === 'light' ? 'light' : 'heavy', overrides: object(row.overrides), regexIds: array(row.regex_ids), lightSystem: row.light_system || '' } : null;
   }
   async hasPreset(id: string): Promise<boolean> { return !!await this.db.prepare(`SELECT 1 FROM desk_presets WHERE id = ?`).bind(id).first(); }
+  async getPresetParams(id: string): Promise<unknown> {
+    const row = await this.db.prepare(`SELECT params FROM desk_presets WHERE id = ?`).bind(id).first<any>();
+    return row ? row.params : null;
+  }
   async listRegex(ids: string[]): Promise<DeskRegex[]> {
     if (!ids.length) return [];
     const result = await this.db.prepare(`SELECT id, find, flags, replace, direction, meta FROM desk_regex WHERE id IN (${ids.map(() => '?').join(', ')}) AND enabled = 1 ORDER BY sort_order, id`).bind(...ids).all<any>();

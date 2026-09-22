@@ -23,6 +23,7 @@ import { parseStateBoard as parseCoreStateBoard, STATEBOARD_MAX_BYTES as CORE_ST
 import type { DeskAssetStorage, DeskStorage, DeskStoryStorage, DeskTurnStorage, SemanticSearchAdapter } from '../core/storage.ts';
 import { AnthropicStreamBackend } from '../adapters/streamModelBackends.ts';
 import { validateDeskChannelConfig } from '../core/deskChannelConfig.ts';
+import { DEFAULT_THINKING_TAGS } from '../tools/deskThinkingTags.ts';
 
 interface DeskChatEnv {
   OC_DB: D1Database;
@@ -278,6 +279,8 @@ export async function handleDeskChat(
   const systemBlocks: Array<{ text: string; cache: boolean }> = assembled.system;
   const tail: string = assembled.tail;
   const report: any = assembled.report;
+  // 分流器标签名单与装配同一快照的预设,不另读一次,免得中途换预设错配。
+  const thinkingTags: string[] = Array.isArray(assembled.thinkingTags) && assembled.thinkingTags.length ? assembled.thinkingTags : DEFAULT_THINKING_TAGS;
 
   // ===== SSE 骨架(照 editorial.ts 原样克隆)=====
   const { readable, writable } = new TransformStream();
@@ -409,7 +412,7 @@ export async function handleDeskChat(
     if (signal?.aborted) controller.abort();
     const backend = new AnthropicStreamBackend({ apiKey: env.ANTHROPIC_API_KEY, baseUrl: env.ANTHROPIC_BASE_URL, userId: USER_ID });
     let failed = false;
-    const result = await backend.streamChat({ system: systemBlocks, prompt: tail, model, signal: controller.signal, onEvent: async (event) => {
+    const result = await backend.streamChat({ system: systemBlocks, prompt: tail, model, signal: controller.signal, thinkingTags, onEvent: async (event) => {
       if (clientGone) { controller.abort(); return; }
       if (event.type === 'text') await send({ type: 'text', text: event.text });
       else if (event.type === 'thinking') await send({ type: 'thinking', text: event.text });

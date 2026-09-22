@@ -6,6 +6,7 @@ import { TavernStudyHost } from '../src/core/tavernStudyHost.ts';
 import { TavernStudyMcpServer } from '../src/mcp/server.ts';
 import type { AuthContext } from '../src/auth.ts';
 import type { ModelBackend, StreamChatArgs } from '../src/core/modelBackend.ts';
+import { createLiteralThinkingSplitter } from '../src/shared/text.ts';
 
 // Generated-board fixtures must satisfy the write-path protocol gate (core/stateBoard.ts
 // stateBoardGateErrors): all five protocol keys present, target shapes down to sub-values.
@@ -279,4 +280,66 @@ test('full desk lifecycle in the memory host: import, generate, roll, switch, ed
   const comments = await mcp.handle({ jsonrpc: '2.0', id: 6, method: 'tools/call', params: { name: 'bookclub', arguments: { action: 'comments', chapter_id: chapterId } } });
   assert.equal(comments.result.structuredContent.count, 1);
   assert.equal(comments.result.structuredContent.comments[0].content, 'Great opening line.');
+});
+
+// A model backend that behaves like AnthropicStreamBackend's own splitter wiring: it runs the
+// real createLiteralThinkingSplitter over a canned raw reply, honoring whatever thinkingTags it
+// was handed (undefined falls back to the splitter's own ['thinking'] default). This is how we
+// prove assembleDesk's thinkingTags actually reaches ModelBackend.streamChat through both
+// TavernStudyHost.generateDeskTurn legs (normal + roll) and DeskGenerationService — without
+// re-testing AnthropicStreamBackend's own HTTP/SSE parsing, which streamModelBackends.test.ts
+// already covers.
+function splittingModel(raw: string): ModelBackend {
+  return {
+    async streamChat(args: StreamChatArgs) {
+      let text = ''; let thinking = '';
+      const splitter = createLiteralThinkingSplitter(args.model, async (t) => { text += t; }, async (t) => { thinking += t; }, true, args.thinkingTags);
+      await splitter.feed(raw);
+      await splitter.flush();
+      return { ok: true, terminal: 'clean', text, thinking, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    },
+  };
+}
+
+test('generateDeskTurn(normal+roll) forwards assembled.thinkingTags through DeskGenerationService: preset-configured <分镜> diverts to thinking on both legs', async () => {
+  const storage = createMemoryStorage({
+    deskRecipes: [{ id: 'r', presetId: 'p', weight: 'light', overrides: {}, regexIds: [], lightSystem: 'Continue.' }],
+    deskPresetIds: ['p'],
+    deskPresetParams: { p: { thinkingTags: ['分镜'] } },
+  });
+  const host = new TavernStudyHost({ storage, model: splittingModel('<分镜>清单</分镜>正文') });
+  const made = await host.desk.createWindow({ project: 'p', title: 'w', recipeId: 'r' });
+  if (!made.success) return;
+
+  const generated = await host.generateDeskTurn({ windowId: made.window.id, content: 'go' });
+  assert.equal(generated.success, true);
+  const win = await host.desk.getWindow(made.window.id);
+  const assistantFloor = win.success ? win.floors.find((f) => f.role === 'assistant') : undefined;
+  assert.equal(assistantFloor?.content, '正文');
+  assert.ok(!String(assistantFloor?.content).includes('分镜'));
+  assert.equal(assistantFloor?.thinking, '清单');
+
+  const rolled = await host.generateDeskTurn({ windowId: made.window.id, roll: true });
+  assert.equal(rolled.success, true);
+  const afterRoll = await host.desk.getWindow(made.window.id);
+  const rolledFloor = afterRoll.success ? afterRoll.floors.find((f) => f.role === 'assistant') : undefined;
+  assert.equal(rolledFloor?.content, '正文');
+  assert.ok(!String(rolledFloor?.content).includes('分镜'));
+  assert.equal(rolledFloor?.thinking, '清单');
+});
+
+test('control: preset without thinkingTags falls back to default (only literal thinking), <分镜> stays in content untouched', async () => {
+  const storage = createMemoryStorage({
+    deskRecipes: [{ id: 'r', presetId: 'p', weight: 'light', overrides: {}, regexIds: [], lightSystem: 'Continue.' }],
+    deskPresetIds: ['p'],
+  });
+  const host = new TavernStudyHost({ storage, model: splittingModel('<分镜>清单</分镜>正文') });
+  const made = await host.desk.createWindow({ project: 'p', title: 'w', recipeId: 'r' });
+  if (!made.success) return;
+  const generated = await host.generateDeskTurn({ windowId: made.window.id, content: 'go' });
+  assert.equal(generated.success, true);
+  const win = await host.desk.getWindow(made.window.id);
+  const assistantFloor = win.success ? win.floors.find((f) => f.role === 'assistant') : undefined;
+  assert.equal(assistantFloor?.content, '<分镜>清单</分镜>正文');
+  assert.equal(assistantFloor?.thinking, null);
 });

@@ -16,11 +16,12 @@
 // validateRegexFlags)故意写成不碰D1/env、只吃/吐普通对象——verify_desk_import.mjs 直接复制
 // 这几个函数体对着真实样本跑计数,两边必须是同一份逻辑,改这里记得把验证脚本也搬一遍。
 
-import { upsertVector } from '../storage/vectorize';
-import type { Ai, VectorizeIndex } from '../storage/vectorize';
-import { isPatternUnsafe } from '../shared/regexSafety';
-import { embedMemory } from './study';
-import type { CharacterCard } from '../core/characterCard';
+import { upsertVector } from '../storage/vectorize.ts';
+import type { Ai, VectorizeIndex } from '../storage/vectorize.ts';
+import { isPatternUnsafe } from '../shared/regexSafety.ts';
+import { embedMemory } from './study.ts';
+import type { CharacterCard } from '../core/characterCard.ts';
+import { validateThinkingTags } from './deskThinkingTags.ts';
 
 interface DeskEnv {
   OC_DB: D1Database;
@@ -331,6 +332,11 @@ export async function deskImportPreset(env: DeskEnv, raw: any, nameOverride?: st
   const { blocks, ignoredOrders } = parsePresetBlocks(raw);
   const regex = parsePresetRegex(raw);
   const params = parsePresetParams(raw);
+  // 思考栏标签走独立扩展键(不进 SAMPLER_PARAM_KEYS 白名单):deskRecipeExport 写在
+  // tavern_study_recipe.thinkingTags,这里读回来过一遍跟 PATCH 保存路径同款的校验,合法且非空
+  // 才补进 params——非法/缺失都静默不写,不因为这一个键不干净就拒收整份预设包。
+  const importedThinkingTags = validateThinkingTags((raw as any)?.tavern_study_recipe?.thinkingTags);
+  if (importedThinkingTags.ok && importedThinkingTags.tags.length > 0) params.thinkingTags = importedThinkingTags.tags;
 
   // 落库前拦重复 identifier(desk_blocks 有 UNIQUE(preset_id, identifier),等 D1 报错才发现太晚)
   const seenIdentifiers = new Set<string>();
@@ -929,6 +935,29 @@ export async function deskListPresets(env: DeskEnv): Promise<any> {
     return { success: true, count: rows.length, presets: rows };
   } catch (err: any) {
     return { success: false, error: err.message };
+  }
+}
+
+// ===== PATCH /api/oc/desk/presets/:id：改预设包 params(目前只开放 thinking_tags 一扇窗)=====
+export async function deskPresetUpdate(env: DeskEnv, id: string, body: any): Promise<any> {
+  if (!id) return { success: false, error: '缺 id' };
+  const validated = validateThinkingTags(body?.thinking_tags);
+  if (!validated.ok) return { success: false, error: validated.error };
+  try {
+    const row = await env.OC_DB.prepare(`SELECT id, params FROM desk_presets WHERE id = ?`).bind(id).first<any>();
+    if (!row) return { success: false, error: '预设包不存在' };
+    // params 列坏 JSON / 非对象一律拒改写,保住原列供修复;读路径的容错不代表写路径可以覆盖。
+    let params: Record<string, any> = {};
+    if (row.params) {
+      try { params = JSON.parse(row.params); } catch { return { success: false, error: '预设 params 列不是合法 JSON,拒绝改写', server: true }; }
+      if (!params || typeof params !== 'object' || Array.isArray(params)) return { success: false, error: '预设 params 列不是对象,拒绝改写', server: true };
+    }
+    if (validated.tags.length > 0) params.thinkingTags = validated.tags;
+    else delete params.thinkingTags; // 空数组=清空自定义标签,退回默认只认字面thinking
+    await env.OC_DB.prepare(`UPDATE desk_presets SET params = ? WHERE id = ?`).bind(JSON.stringify(params), id).run();
+    return { success: true, preset: { id, params } };
+  } catch (err: any) {
+    return { success: false, error: err.message, server: true };
   }
 }
 

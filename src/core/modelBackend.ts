@@ -12,6 +12,9 @@ export interface StreamChatArgs {
   model: string;
   signal?: AbortSignal;
   onEvent?: (event: ModelStreamEvent) => void | Promise<void>;
+  // 认领的字面思考标签名单(见 shared/text.ts createLiteralThinkingSplitter);缺省时各后端自行
+  // 落回只认字面 <thinking> 的老行为,不是每个 ModelBackend 实现都要支持这个字段。
+  thinkingTags?: string[];
 }
 
 export type StreamChatResult =

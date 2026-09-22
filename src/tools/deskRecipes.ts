@@ -5,6 +5,8 @@
 //
 // id 生成/JSON兜底照抄 desk.ts 头注释那套家法(每文件各自小份复制,不是漏抽公共util,是本仓一贯风格)。
 
+import { readThinkingTags } from './deskThinkingTags.ts';
+
 interface DeskRecipesEnv {
   OC_DB: D1Database;
 }
@@ -107,9 +109,12 @@ export async function deskRecipeExport(env: DeskRecipesEnv, id: string): Promise
   if (!id) return { success: false, error: '缺 id' };
   try {
     const row = await env.OC_DB.prepare(
-      `SELECT r.*, p.raw_json FROM desk_recipes r JOIN desk_presets p ON p.id = r.preset_id WHERE r.id = ?`
+      `SELECT r.*, p.raw_json, p.params AS preset_params FROM desk_recipes r JOIN desk_presets p ON p.id = r.preset_id WHERE r.id = ?`
     ).bind(id).first<any>();
     if (!row) return { success: false, error: '配方不存在' };
+    // 预设的思考栏标签名单(见 tools/deskThinkingTags.ts)不在 recipe.params(配方自己的采样参数)
+    // 里,是预设包一级的配置——容错读取,导出这份快照,不因为它读不出来就拒绝导出整份配方。
+    const presetThinkingTags = readThinkingTags(row.preset_params);
     const recipe = rowToRecipe(row);
     const raw = safeJsonParse(row.raw_json, null);
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { success: false, error: '原预设包JSON已损坏,无法导出' };
@@ -172,7 +177,10 @@ export async function deskRecipeExport(env: DeskRecipesEnv, id: string): Promise
     out.extensions.regex_scripts = regexScripts;
     for (const [k, v] of Object.entries(recipe.params || {})) out[k] = v;
     out.name = recipe.name;
-    out.tavern_study_recipe = { version: 1, name: recipe.name, weight: recipe.weight, exported_at: new Date().toISOString() };
+    out.tavern_study_recipe = {
+      version: 1, name: recipe.name, weight: recipe.weight, exported_at: new Date().toISOString(),
+      ...(presetThinkingTags.length ? { thinkingTags: presetThinkingTags } : {}),
+    };
     return { success: true, name: recipe.name, data: out };
   } catch (err: any) {
     return { success: false, error: err.message, server: true };

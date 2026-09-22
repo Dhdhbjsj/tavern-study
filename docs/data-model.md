@@ -124,7 +124,7 @@
 | `id` (PK) | 预设包 id |
 | `name` | 名称 |
 | `raw_json` | 原始预设 JSON（原样保存，供导出/追溯） |
-| `params` | JSON，解析出的参数快照 |
+| `params` | JSON，解析出的参数快照；可选键 `thinkingTags?: string[]`——改道思考栏的标签名单，见 README「预设里的「思考」块撞闸了怎么办」 |
 | `block_count` | 积木块数量 |
 | `created_at` | 时间戳 |
 

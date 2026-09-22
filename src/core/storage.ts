@@ -56,6 +56,10 @@ export interface DeskStorage {
 export interface DeskAssetStorage {
   getRecipe(id: string): Promise<DeskRecipe | null>;
   hasPreset(id: string): Promise<boolean>;
+  // 预设包的 params 快照:null=预设包不存在,否则原样返回该列的值(JSON 字符串或已解析对象,
+  // 由各实现自行决定;读取方——见 chat/deskAssemble.ts——两种形状都认)。装配要跟本轮用的是
+  // 同一份快照,所以跟 getRecipe 分开单独查一次,不从 hasPreset 顺带返回。
+  getPresetParams(id: string): Promise<unknown>;
   listRegex(ids: string[]): Promise<DeskRegex[]>;
   // 配方名单为空时的默认上行正则:本预设包 + 全局的、开着的 up/both 规则,预设优先于全局。
   listUpRegexForPreset(presetId: string): Promise<DeskRegex[]>;

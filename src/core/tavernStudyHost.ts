@@ -9,6 +9,7 @@ import type { DeskAssetPack } from './storage.ts';
 import { parseStateBoard } from './stateBoard.ts';
 import { extractAssistantFoldBody, selectDeskTimelineFoldBatch } from './deskTimelineFold.ts';
 import { DESK_TIMELINE_KEEP } from './deskLimits.ts';
+import { DEFAULT_THINKING_TAGS } from '../tools/deskThinkingTags.ts';
 
 // Auto-fold only kicks in once the un-folded tail grows past this many floors; a single call
 // folds at most BATCH_MAX of them, always leaving DESK_TIMELINE_KEEP floors of raw text behind.
@@ -218,6 +219,8 @@ export class TavernStudyHost {
         timeline: timelineText,
       });
       if (!assembled.success) return { ...assembled, userFloorCommitted: userFloor };
+      // 分流器标签名单与装配同一快照的预设,不另读一次,免得中途换预设错配。
+      const thinkingTags: string[] = Array.isArray(assembled.thinkingTags) && assembled.thinkingTags.length ? assembled.thinkingTags : DEFAULT_THINKING_TAGS;
       let generated: any;
       try { generated = await this.generation.generate({
         windowId: window.id,
@@ -232,6 +235,7 @@ export class TavernStudyHost {
         boardBeforeTrusted: true,
         committedAt: after(userFloor.createdAt),
         signal: input.signal,
+        thinkingTags,
       }); } catch { return { success: false, error: 'model_failure', userFloorCommitted: userFloor }; }
       if (generated.success) return { ...generated, userFloor };
       const { detail: _privateDetail, ...publicFailure } = generated;
@@ -289,6 +293,8 @@ export class TavernStudyHost {
       timeline: timelineText,
     });
     if (!assembled.success) return assembled;
+    // 分流器标签名单与装配同一快照的预设,不另读一次,免得中途换预设错配。
+    const rollThinkingTags: string[] = Array.isArray(assembled.thinkingTags) && assembled.thinkingTags.length ? assembled.thinkingTags : DEFAULT_THINKING_TAGS;
     let rolled: any;
     try { rolled = await this.generation.generate({
       windowId: window.id,
@@ -303,6 +309,7 @@ export class TavernStudyHost {
       boardBeforeTrusted: foundRollBoard,
       committedAt: after(target.createdAt),
       signal: input.signal,
+      thinkingTags: rollThinkingTags,
     }); } catch { return { success: false, error: 'model_failure' }; }
     if (rolled.success) return rolled;
     const { detail: _rollPrivateDetail, ...rollPublicFailure } = rolled;

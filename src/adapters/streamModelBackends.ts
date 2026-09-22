@@ -10,6 +10,23 @@ export function safeEndpoint(raw: string): string | null { try { const url = new
 
 export interface AnthropicBackendOptions { apiKey: string; baseUrl?: string; timeoutMs?: number; userId?: string; fetch?: Fetcher }
 
+// 分流器 onBlockOpen 工厂:字面思考名单里多个标签相继起块时块间补个分隔,别粘一起。
+// pushSeparator 允许返回 Promise——这里的 onEvent 是异步的(要给上游 SSE 写手背压),
+// 分隔字节也要走同一条 await 链,不能悄悄脱线。
+function makeThinkingBlockSeparator(
+  getThinking: () => string,
+  appendThinking: (sep: string) => void,
+  pushSeparator: (sep: string) => void | Promise<void>
+) {
+  return async () => {
+    const cur = getThinking();
+    if (!cur || cur.endsWith('\n\n')) return;
+    const sep = cur.endsWith('\n') ? '\n' : '\n\n';
+    appendThinking(sep);
+    await pushSeparator(sep);
+  };
+}
+
 export class AnthropicStreamBackend implements ModelBackend {
   private readonly options: AnthropicBackendOptions;
   constructor(options: AnthropicBackendOptions) { this.options = options; }
@@ -23,7 +40,9 @@ export class AnthropicStreamBackend implements ModelBackend {
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null; let naturalEof = false; const blocks = new Map<number, 'text' | 'thinking' | 'redacted'>();
     const splitter = createLiteralThinkingSplitter(args.model,
       async (chunk) => { if (!chunk) return; text += chunk; await args.onEvent?.({ type: 'text', text: chunk }); },
-      async (chunk) => { if (!chunk) return; thinking += chunk; await args.onEvent?.({ type: 'thinking', text: chunk }); }, true);
+      async (chunk) => { if (!chunk) return; thinking += chunk; await args.onEvent?.({ type: 'thinking', text: chunk }); }, true,
+      args.thinkingTags,
+      makeThinkingBlockSeparator(() => thinking, (sep) => { thinking += sep; }, (sep) => args.onEvent?.({ type: 'thinking', text: sep })));
     try {
       const response = await (this.options.fetch || fetch)(endpoint, { method: 'POST', headers: { 'x-api-key': this.options.apiKey, 'anthropic-version': '2023-06-01', 'anthropic-beta': 'extended-cache-ttl-2025-04-11', 'content-type': 'application/json' },
         body: JSON.stringify({ ...buildModelParams(args.model), system: args.system.map((block) => block.cache ? { type: 'text', text: block.text, cache_control: { type: 'ephemeral', ttl: '1h' } } : { type: 'text', text: block.text }), messages: [{ role: 'user', content: args.prompt }], ...(this.options.userId ? { metadata: { user_id: this.options.userId } } : {}) }), signal: controller.signal });

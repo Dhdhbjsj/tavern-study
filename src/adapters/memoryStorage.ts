@@ -9,6 +9,9 @@ export interface MemorySeed {
   deskFloors?: DeskFloor[];
   deskRecipes?: DeskRecipe[];
   deskPresetIds?: string[];
+  // 预设包 id → params 快照(可选);缺省即该包 params 为空对象。跟 D1DeskAssetStorage.getPresetParams
+  // 同一份合同:key 不在 deskPresetIds 里时 getPresetParams 返回 null,不看这份 map。
+  deskPresetParams?: Record<string, unknown>;
   // scope/presetId/enabled/sortOrder 只给 listUpRegexForPreset 的默认名单逻辑用,其余读取按原样兼容。
   deskRegex?: Array<DeskRegex & { scope?: 'preset' | 'global'; presetId?: string; enabled?: boolean; sortOrder?: number }>;
   deskBlocks?: Array<DeskPromptBlock & { presetId: string }>;
@@ -42,10 +45,11 @@ export class MemoryDeskStoryStorage implements DeskStoryStorage {
 }
 
 export class MemoryDeskAssetStorage implements DeskAssetStorage {
-  private readonly seed: Required<Pick<MemorySeed, 'deskRecipes' | 'deskPresetIds' | 'deskRegex' | 'deskBlocks' | 'deskLore'>>;
-  constructor(seed: Pick<MemorySeed, 'deskRecipes' | 'deskPresetIds' | 'deskRegex' | 'deskBlocks' | 'deskLore'> = {}) { this.seed = structuredClone({ deskRecipes: seed.deskRecipes || [], deskPresetIds: seed.deskPresetIds || [], deskRegex: seed.deskRegex || [], deskBlocks: seed.deskBlocks || [], deskLore: seed.deskLore || [] }); }
+  private readonly seed: Required<Pick<MemorySeed, 'deskRecipes' | 'deskPresetIds' | 'deskRegex' | 'deskBlocks' | 'deskLore'>> & Pick<MemorySeed, 'deskPresetParams'>;
+  constructor(seed: Pick<MemorySeed, 'deskRecipes' | 'deskPresetIds' | 'deskRegex' | 'deskBlocks' | 'deskLore' | 'deskPresetParams'> = {}) { this.seed = structuredClone({ deskRecipes: seed.deskRecipes || [], deskPresetIds: seed.deskPresetIds || [], deskRegex: seed.deskRegex || [], deskBlocks: seed.deskBlocks || [], deskLore: seed.deskLore || [], deskPresetParams: seed.deskPresetParams || {} }); }
   async getRecipe(id: string) { const row = this.seed.deskRecipes?.find((x) => x.id === id); return row ? structuredClone(row) : null; }
   async hasPreset(id: string) { return !!this.seed.deskPresetIds?.includes(id); }
+  async getPresetParams(id: string) { if (!this.seed.deskPresetIds?.includes(id)) return null; return structuredClone(this.seed.deskPresetParams?.[id] ?? {}); }
   async listRegex(ids: string[]) { return (this.seed.deskRegex || []).filter((x) => ids.includes(x.id)).map((x) => structuredClone(x)); }
   // 配方名单为空时的默认名单:本预设包 + 全局的、开着的 up/both 规则,预设优先于全局,组内按 sortOrder、id。
   async listUpRegexForPreset(presetId: string) {

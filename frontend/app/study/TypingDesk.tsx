@@ -359,6 +359,7 @@ const DESK_MODELS = [
   { id: 'claude-opus-4-7', label: 'Opus 4.7' },
   { id: 'claude-opus-4-8', label: 'Opus 4.8' },
   { id: 'claude-opus-5', label: 'Opus 5' },
+  { id: 'claude-opus-5-5', label: 'Opus 5.5' },
   { id: 'claude-fable-5', label: 'Fable 5' },
   { id: 'claude-fable-5-1', label: 'Fable 5.1' },
 ];

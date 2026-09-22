@@ -44,3 +44,19 @@ test('strip-aside rule: cuts prologue/branches/aside tags; clean floors are unto
   const plain = '就是正文';
   assert.equal(applyUpRegex(plain, [stripAside], 1), plain);
 });
+
+// README/文具盒说明推荐的"思考栏标签"回喂兜底正则,标签要求独占一行(多行块)。applyUpRegex 不
+// 隐式给规则加 s(dotAll)/m(multiline)——`^.+</分镜>` 这种写法里 `.` 吃不了换行,标签独占一行时
+// 整条规则形同虚设,块会原样漏回正文。`^[\s\S]*?</分镜>\s*` 不依赖 dotAll,靠字符类本身跨行。
+test('recommended fallback pattern ^[\\s\\S]*?</分镜>\\s* strips a multi-line, line-own <分镜> block; the un-dotAll ^.+</分镜> it replaces does not', () => {
+  const multilineBlock = '<分镜>\n清单一\n清单二\n</分镜>\n正文';
+  const fallback = rule({ find: '^[\\s\\S]*?</分镜>\\s*', replace: '', flags: '' });
+  assert.equal(applyUpRegex(multilineBlock, [fallback], 1), '正文');
+  const plain = '没有分镜块的正文';
+  assert.equal(applyUpRegex(plain, [fallback], 1), plain);
+
+  // 对照:旧文案里 `^.+</分镜>` 没有 s 标志,`.` 跨不过标签独占一行前的换行,整条规则不命中,
+  // 多行块原样漏回正文——这正是这条规则要修的坑,留着当反面对照防止以后又抄回这个写法。
+  const brokenWithoutDotAll = rule({ find: '^.+</分镜>', replace: '', flags: '' });
+  assert.equal(applyUpRegex(multilineBlock, [brokenWithoutDotAll], 1), multilineBlock);
+});
