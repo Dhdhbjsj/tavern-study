@@ -1,0 +1,23 @@
+name: D1 Migration Preparation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-migrations:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check migration files
+        run: |
+          echo "Checking Tavern Study migrations..."
+          ls -la examples/cloudflare/schema/migrations/
+          test -f examples/cloudflare/schema/migrations/0001_initial.sql
+          test -f examples/cloudflare/schema/migrations/0002_desk_note_two_state.sql
+          echo "Both migration files exist."
