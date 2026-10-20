@@ -1,4 +1,5 @@
-name: D1 Migration Preparation
+
+name: D1 Migration Local Test
 
 on:
   workflow_dispatch:
@@ -7,17 +8,28 @@ permissions:
   contents: read
 
 jobs:
-  inspect-migrations:
+  test-migrations:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Check migration files
         run: |
-          echo "Checking Tavern Study migrations..."
-          ls -la examples/cloudflare/schema/migrations/
           test -f examples/cloudflare/schema/migrations/0001_initial.sql
           test -f examples/cloudflare/schema/migrations/0002_desk_note_two_state.sql
           echo "Both migration files exist."
+
+      - name: Apply migrations to local D1
+        run: |
+          npx --yes wrangler@4 d1 migrations apply tavern-study --local
+
+      - name: Verify database tables
+        run: |
+          npx --yes wrangler@4 d1 execute tavern-study --local --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
