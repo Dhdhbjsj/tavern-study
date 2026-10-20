@@ -5,7 +5,7 @@ compatibility_date = "2026-07-01"
 [[d1_databases]]
 binding = "OC_DB"
 database_name = "tavern-study"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "3cec3006-7979-401f-a5d8-96daa4cfdd4e"
 migrations_dir = "examples/cloudflare/schema/migrations"
 
 # Optional: semantic search for study/shelf entries and chapter recall. Everything degrades
