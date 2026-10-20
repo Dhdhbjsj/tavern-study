@@ -11,9 +11,9 @@ migrations_dir = "examples/cloudflare/schema/migrations"
 # Optional: semantic search for study/shelf entries and chapter recall. Everything degrades
 # gracefully without it (StudyService reports capability:'disabled'; desk assembly's "past
 # chapters" section simply stays empty) — bind these only if you want semantic search on.
-[[vectorize]]
-binding = "OC_VECTORIZE"
-index_name = "REPLACE_WITH_YOUR_VECTORIZE_INDEX"
+# [[vectorize]]
+# binding = "OC_VECTORIZE"
+# index_name = "REPLACE_WITH_YOUR_VECTORIZE_INDEX"
 
 [ai]
 binding = "AI"
